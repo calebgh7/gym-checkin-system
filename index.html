@@ -16,11 +16,20 @@
         console.warn = () => {}; // Suppress development warnings
 
         const GymCheckInSystem = () => {
-          const [currentView, setCurrentView] = useState('checkin');
+          const [currentView, setCurrentView] = useState('welcome');
           const [athletes, setAthletes] = useState([]);
           const [checkedInToday, setCheckedInToday] = useState([]);
-          const [searchQuery, setSearchQuery] = useState('');
-          const searchInputRef = useRef(null);
+          const [isLoading, setIsLoading] = useState(false);
+          const [error, setError] = useState(null);
+          const [selectedEvent, setSelectedEvent] = useState('');
+          const [athleteHistory, setAthleteHistory] = useState({});
+          const [events, setEvents] = useState([]);
+          const [isLoadingEvents, setIsLoadingEvents] = useState(false);
+          const [showCreateEvent, setShowCreateEvent] = useState(false);
+          const [newEventName, setNewEventName] = useState('');
+          const [isCreatingEvent, setIsCreatingEvent] = useState(false);
+          const [checkingInAthleteId, setCheckingInAthleteId] = useState(null);
+          const eventInputRef = useRef(null);
           const [waiverForm, setWaiverForm] = useState({
             firstName: '',
             lastName: '',
@@ -39,15 +48,80 @@
 
           useEffect(() => {
             loadAthletes();
-          }, []);
+            loadEvents();
+            // Don't load check-ins here - wait until we have events and selectedEvent
+            
+            // Add keyboard shortcuts
+            const handleKeyPress = (e) => {
+              if (e.ctrlKey || e.metaKey) {
+                switch(e.key) {
+                  case '0':
+                    e.preventDefault();
+                    setCurrentView('welcome');
+                    break;
+                  case '1':
+                    e.preventDefault();
+                    setCurrentView('checkin');
+                    break;
+                  case '3':
+                    e.preventDefault();
+                    setCurrentView('admin');
+                    break;
+                  case 'r':
+                    e.preventDefault();
+                    loadAthletes();
+                    break;
+                }
+              }
+              // Focus search on '/' key
+              if (e.key === '/' && currentView === 'checkin' && !e.target.matches('input, textarea')) {
+                e.preventDefault();
+                searchInputRef.current?.focus();
+              }
+            };
+            
+            document.addEventListener('keydown', handleKeyPress);
+            return () => document.removeEventListener('keydown', handleKeyPress);
+          }, [currentView]);
+
+          // Reload today's check-ins when returning to check-in view
+          useEffect(() => {
+            if (currentView === 'checkin') {
+              console.log('Returned to check-in view, reloading today\'s check-ins...');
+              console.log('DEBUG: Current view is checkin, checkedInToday state:', checkedInToday);
+              loadTodaysCheckIns();
+            }
+          }, [currentView, loadTodaysCheckIns]);
+
+          // Load today's check-ins when we have both events loaded and a selected event
+          useEffect(() => {
+            if (events.length > 0 && selectedEvent) {
+              console.log('Events loaded and event selected, loading today\'s check-ins...');
+              console.log('DEBUG: events.length =', events.length, 'selectedEvent =', selectedEvent);
+              loadTodaysCheckIns();
+            }
+          }, [events, selectedEvent, loadTodaysCheckIns]);
+
+          // Focus the event input when create event form is shown
+          useEffect(() => {
+            if (showCreateEvent && eventInputRef.current) {
+              eventInputRef.current.focus();
+            }
+          }, [showCreateEvent]);
 
           const loadAthletes = async () => {
             try {
+              setIsLoading(true);
+              setError(null);
               console.log('=== LOADING ATHLETES DEBUG ===');
               console.log('Fetching from URL:', SHEETS_URL);
               
               const response = await fetch(SHEETS_URL);
               console.log('Response status:', response.status);
+              
+              if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+              }
               
               const data = await response.json();
               console.log('Full JSON response:', JSON.stringify(data, null, 2));
@@ -77,7 +151,8 @@
                       dateOfBirth: row[7] ? String(row[7]).split('T')[0] : '',
                       emergencyContact: String(row[8] || '').trim(),
                       emergencyPhone: String(row[9] || '').trim(),
-                      medicalConditions: String(row[10] || '').trim()
+                      medicalConditions: String(row[10] || '').trim(),
+                      lastVisit: row[11] ? String(row[11]).split('T')[0] : null
                     };
                     
                     console.log(`Created athlete ${index}:`, athlete);
@@ -93,20 +168,478 @@
                   
                   if (validAthletes.length === 0) {
                     console.error('No athletes passed validation!');
+                    setError('No valid athlete data found');
                   }
                 } else {
                   console.log('Only header row found, no data');
                   setAthletes([]);
+                  setError('No athlete data available');
                 }
               } else {
                 console.error('Invalid response format:', data);
                 setAthletes([]);
+                setError('Invalid data format received from server');
               }
             } catch (error) {
               console.error('Error loading athletes:', error);
               setAthletes([]);
+              setError(`Failed to load athletes: ${error.message}`);
+            } finally {
+              setIsLoading(false);
             }
           };
+
+          const loadEvents = useCallback(async () => {
+            try {
+              setIsLoadingEvents(true);
+              console.log('=== LOADING EVENTS DEBUG ===');
+              console.log('Fetching events from URL:', SHEETS_URL);
+              
+              const response = await fetch(`${SHEETS_URL}?action=getEvents`);
+              console.log('Events response status:', response.status);
+              
+              if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+              }
+              
+              const data = await response.json();
+              console.log('Events JSON response:', JSON.stringify(data, null, 2));
+              
+              if (data.success && data.events) {
+                console.log('Events array length:', data.events.length);
+                
+                if (data.events.length > 1) {
+                  // Skip header row and process events
+                  const rawEvents = data.events.slice(1);
+                  console.log('Raw events before processing:', rawEvents);
+                  
+                  // Get today's date in local timezone for comparison
+                  const today = new Date();
+                  const todayString = today.getFullYear() + '-' + 
+                    String(today.getMonth() + 1).padStart(2, '0') + '-' + 
+                    String(today.getDate()).padStart(2, '0'); // YYYY-MM-DD in local time
+                  console.log('Today for filtering (local time):', todayString, 'Local date object:', today);
+                  
+                  const eventOptions = rawEvents.map((row, index) => {
+                    const eventDate = row[0]; // Column A - date (your sheet structure)
+                    const eventName = row[1]; // Column B - event name (your sheet structure)
+                    
+                    console.log(`Processing event ${index}:`, { 
+                      eventDate,
+                      eventDateType: typeof eventDate,
+                      eventName, 
+                      eventNameType: typeof eventName,
+                      fullRow: row
+                    });
+                    
+                    if (!eventName || !eventDate) {
+                      console.log(`Skipping event ${index} - missing name or date`);
+                      return null;
+                    }
+                    
+                    // Clean the event name to ensure it's a proper string
+                    const cleanEventName = String(eventName).trim();
+
+                    // More robust date parsing for MM/DD/YY format
+                    let date;
+                    let rawDateValue = eventDate;
+                    
+                    if (typeof eventDate === 'string') {
+                      // Handle MM/DD/YY format from your sheet
+                      if (eventDate.includes('/')) {
+                        // Parse MM/DD/YY format
+                        const [month, day, year] = eventDate.split('/');
+                        const fullYear = year.length === 2 ? `20${year}` : year;
+                        date = new Date(`${fullYear}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`);
+                      } else {
+                        // Handle other string formats
+                        date = new Date(eventDate);
+                      }
+                    } else if (eventDate instanceof Date) {
+                      date = new Date(eventDate);
+                    } else {
+                      // Try to create date from the value
+                      date = new Date(eventDate);
+                    }
+                    
+                    // Check if date is valid
+                    if (isNaN(date.getTime())) {
+                      console.log(`Invalid date for event ${index}:`, rawDateValue);
+                      return null; // Skip invalid dates instead of using fallback
+                    }
+                    
+                    // Convert event date to YYYY-MM-DD format for comparison (local time)
+                    const eventDateString = date.getFullYear() + '-' + 
+                      String(date.getMonth() + 1).padStart(2, '0') + '-' + 
+                      String(date.getDate()).padStart(2, '0');
+                    
+                    console.log(`Date comparison for event ${index}:`, { 
+                      original: rawDateValue, 
+                      parsed: date, 
+                      eventDateString: eventDateString + ' (local)',
+                      todayString: todayString + ' (local)',
+                      isToday: eventDateString === todayString,
+                      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone
+                    });
+                    
+                    // Only include events that are scheduled for today
+                    if (eventDateString !== todayString) {
+                      console.log(`Skipping event ${index} - not scheduled for today (${eventDateString} !== ${todayString})`);
+                      return null;
+                    }
+                    
+                    // Format the date to "Month Day" format
+                    const formattedDate = date.toLocaleDateString('en-US', { 
+                      month: 'long', 
+                      day: 'numeric'
+                    });
+
+                    const eventOption = {
+                      id: `${cleanEventName.toLowerCase().replace(/\s+/g, '-')}-${date.getTime()}`,
+                      name: `${formattedDate} - ${cleanEventName}`,
+                      eventName: cleanEventName, // Store cleaned event name for backend
+                      date: eventDateString, // Use local date string (YYYY-MM-DD)
+                      originalSheetDate: rawDateValue // Store the original date from the sheet
+                    };
+                    
+                    console.log(`Created event option ${index}:`, eventOption);
+                    return eventOption;
+                  }).filter(event => event !== null);
+                  
+                  console.log('All event options before deduplication:', eventOptions);
+                  
+                  // Remove duplicates based on name (but keep the logic simpler)
+                  const uniqueEvents = eventOptions.filter((event, index, self) => 
+                    index === self.findIndex(e => e.name === event.name)
+                  );
+                  
+                  console.log('Final unique events for today:', uniqueEvents);
+                  
+                  if (uniqueEvents.length > 0) {
+                    setEvents(uniqueEvents);
+                  } else {
+                    console.log('No events scheduled for today, showing message to user');
+                    // Set a special state to show "no events today" message
+                    setEvents([]);
+                  }
+                } else {
+                  console.log('No event data found, using default events');
+                  // Fallback to default events if no data in sheet
+                  const today = new Date();
+                  const formattedToday = today.toLocaleDateString('en-US', { 
+                    month: 'long', 
+                    day: 'numeric' 
+                  });
+                  
+                  setEvents([
+                    { 
+                      id: 'open-gym-default', 
+                      name: `${formattedToday} - Open Gym`,
+                      eventName: 'Open Gym',
+                      date: today.toISOString().split('T')[0]
+                    },
+                    { 
+                      id: 'volleyball-default', 
+                      name: `${formattedToday} - Volleyball`,
+                      eventName: 'Volleyball',
+                      date: today.toISOString().split('T')[0]
+                    },
+                    { 
+                      id: 'strength-training-default', 
+                      name: `${formattedToday} - Strength Training`,
+                      eventName: 'Strength Training',
+                      date: today.toISOString().split('T')[0]
+                    },
+                    { 
+                      id: 'other-default', 
+                      name: `${formattedToday} - Other`,
+                      eventName: 'Other',
+                      date: today.toISOString().split('T')[0]
+                    }
+                  ]);
+                }
+              } else {
+                console.error('Invalid events response format:', data);
+                // Fallback to default events
+                const today = new Date();
+                const formattedToday = today.toLocaleDateString('en-US', { 
+                  month: 'long', 
+                  day: 'numeric' 
+                });
+                
+                setEvents([
+                  { 
+                    id: 'open-gym-default', 
+                    name: `${formattedToday} - Open Gym`,
+                    eventName: 'Open Gym',
+                    date: today.toISOString().split('T')[0]
+                  },
+                  { 
+                    id: 'volleyball-default', 
+                    name: `${formattedToday} - Volleyball`,
+                    eventName: 'Volleyball',
+                    date: today.toISOString().split('T')[0]
+                  },
+                  { 
+                    id: 'strength-training-default', 
+                    name: `${formattedToday} - Strength Training`,
+                    eventName: 'Strength Training',
+                    date: today.toISOString().split('T')[0]
+                  },
+                  { 
+                    id: 'other-default', 
+                    name: `${formattedToday} - Other`,
+                    eventName: 'Other',
+                    date: today.toISOString().split('T')[0]
+                  }
+                ]);
+              }
+            } catch (error) {
+              console.error('Error loading events:', error);
+              // Fallback to default events on error
+              const today = new Date();
+              const formattedToday = today.toLocaleDateString('en-US', { 
+                month: 'long', 
+                day: 'numeric' 
+              });
+              
+              setEvents([
+                { 
+                  id: 'open-gym-default', 
+                  name: `${formattedToday} - Open Gym`,
+                  eventName: 'Open Gym',
+                  date: today.toISOString().split('T')[0]
+                },
+                { 
+                  id: 'volleyball-default', 
+                  name: `${formattedToday} - Volleyball`,
+                  eventName: 'Volleyball',
+                  date: today.toISOString().split('T')[0]
+                },
+                { 
+                  id: 'strength-training-default', 
+                  name: `${formattedToday} - Strength Training`,
+                  eventName: 'Strength Training',
+                  date: today.toISOString().split('T')[0]
+                },
+                { 
+                  id: 'other-default', 
+                  name: `${formattedToday} - Other`,
+                  eventName: 'Other',
+                  date: today.toISOString().split('T')[0]
+                }
+              ]);
+            } finally {
+              setIsLoadingEvents(false);
+            }
+          }, [SHEETS_URL]);
+
+          const loadTodaysCheckIns = useCallback(async () => {
+            try {
+              console.log('Loading today\'s check-ins from CheckIns sheet...');
+              
+              // Get today's date in MM/DD/YY format to match what we store
+              const today = new Date();
+              const month = String(today.getMonth() + 1).padStart(2, '0');
+              const day = String(today.getDate()).padStart(2, '0');
+              const year = String(today.getFullYear()).slice(-2);
+              const todayFormatted = `${month}/${day}/${year}`;
+              
+              // Get the selected event name for filtering
+              const selectedEventObj = events.find(e => e.id === selectedEvent);
+              const eventNameForFilter = selectedEventObj ? selectedEventObj.eventName : '';
+              
+              console.log(`Loading check-ins for date: ${todayFormatted}, event: "${eventNameForFilter}"`);
+              console.log('DEBUG: selectedEvent =', selectedEvent);
+              console.log('DEBUG: selectedEventObj =', selectedEventObj);
+              console.log('DEBUG: events =', events);
+              
+              // Always fetch from server - no localStorage fallback needed
+              let serverUrl = `${SHEETS_URL}?action=getTodaysCheckIns&date=${encodeURIComponent(todayFormatted)}`;
+              if (eventNameForFilter) {
+                serverUrl += `&event=${encodeURIComponent(eventNameForFilter)}`;
+              }
+              
+              console.log('Fetching check-ins from server:', serverUrl);
+              const response = await fetch(serverUrl);
+              const data = await response.json();
+              
+              console.log('Server response for today\'s check-ins:', data);
+              console.log('DEBUG: Full server response structure:', JSON.stringify(data, null, 2));
+              
+              // Log debug information if available
+              if (data.debug) {
+                console.log('DEBUG: Server debug info:', data.debug);
+                console.log('DEBUG: Total rows in CheckIns sheet:', data.debug.totalRowsInSheet);
+                console.log('DEBUG: All check-ins for today (any event):', data.debug.allTodaysCheckIns);
+                console.log('DEBUG: Requested date:', data.debug.requestedDate);
+                console.log('DEBUG: Requested event:', data.debug.requestedEvent);
+              } else {
+                console.log('DEBUG: No debug info in server response');
+              }
+              
+              // TEMPORARY: Try getting ALL check-ins for today (no event filter) to see if that works
+              console.log('DEBUG: TEMPORARY - Trying to get ALL check-ins for today without event filter...');
+              try {
+                const allCheckInsUrl = `${SHEETS_URL}?action=getTodaysCheckIns&date=${encodeURIComponent(todayFormatted)}`;
+                console.log('DEBUG: Fetching ALL check-ins:', allCheckInsUrl);
+                const allResponse = await fetch(allCheckInsUrl);
+                const allData = await allResponse.json();
+                console.log('DEBUG: ALL check-ins response:', JSON.stringify(allData, null, 2));
+                
+                if (allData.success && allData.checkIns && allData.checkIns.length > 0) {
+                  console.log('DEBUG: Found check-ins when not filtering by event!', allData.checkIns.length);
+                  // Backend should now handle filtering correctly, but keep this as fallback
+                  console.log('DEBUG: Backend filtering should work now, using main response');
+                }
+              } catch (tempError) {
+                console.log('DEBUG: Error in temporary test:', tempError);
+              }
+              console.log('DEBUG: Also fetching ALL check-ins for debugging...');
+              try {
+                const debugUrl = `${SHEETS_URL}?action=getTodaysCheckIns&date=${encodeURIComponent(todayFormatted)}`;
+                const debugResponse = await fetch(debugUrl);
+                const debugData = await debugResponse.json();
+                console.log('DEBUG: ALL check-ins for today (no event filter):', debugData);
+              } catch (debugError) {
+                console.log('DEBUG: Error fetching all check-ins:', debugError);
+              }
+              
+              if (data.success) {
+                const checkIns = data.checkIns || [];
+                console.log(`Found ${checkIns.length} check-ins for today and selected event`);
+                console.log('DEBUG: Individual check-ins:', checkIns);
+                
+                // If we expected check-ins but got empty, try one more time after a delay
+                if (checkIns.length === 0 && checkedInToday.length > 0) {
+                  console.log('Expected check-ins but got empty result, retrying in 2 seconds...');
+                  setTimeout(async () => {
+                    try {
+                      console.log('Retrying check-in fetch...');
+                      let retryUrl = `${SHEETS_URL}?action=getTodaysCheckIns&date=${encodeURIComponent(todayFormatted)}`;
+                      if (eventNameForFilter) {
+                        retryUrl += `&event=${encodeURIComponent(eventNameForFilter)}`;
+                      }
+                      
+                      console.log('Retry URL:', retryUrl);
+                      const retryResponse = await fetch(retryUrl);
+                      const retryData = await retryResponse.json();
+                      console.log('Retry response:', retryData);
+                      
+                      if (retryData.success && retryData.checkIns && retryData.checkIns.length > 0) {
+                        console.log('Retry successful, updating check-ins');
+                        setCheckedInToday(retryData.checkIns);
+                      }
+                    } catch (retryError) {
+                      console.error('Retry failed:', retryError);
+                    }
+                  }, 2000);
+                }
+                
+                setCheckedInToday(checkIns);
+              } else {
+                console.error('Server error:', data.error);
+                setCheckedInToday([]);
+              }
+              
+            } catch (error) {
+              console.error('Error loading today\'s check-ins:', error);
+              // On error, reset to empty array to avoid showing stale data
+              setCheckedInToday([]);
+            }
+          }, [SHEETS_URL, selectedEvent, events]);
+
+          const createNewEvent = useCallback(async () => {
+            if (!newEventName.trim()) {
+              alert('Please enter an event name.');
+              return;
+            }
+
+            try {
+              setIsCreatingEvent(true);
+              
+              // Get today's date in MM/DD/YY format to match your sheet
+              const today = new Date();
+              const month = String(today.getMonth() + 1).padStart(2, '0');
+              const day = String(today.getDate()).padStart(2, '0');
+              const year = String(today.getFullYear()).slice(-2); // Last 2 digits
+              const dateForSheet = `${month}/${day}/${year}`;
+              
+              console.log('Creating new event:', { name: newEventName.trim(), date: dateForSheet });
+              
+              const response = await fetch(`${SHEETS_URL}?action=createEvent&eventName=${encodeURIComponent(newEventName.trim())}&eventDate=${encodeURIComponent(dateForSheet)}`);
+              const data = await response.json();
+              
+              if (data.success) {
+                console.log('Event created successfully');
+                
+                // Reload events from the sheet to get the correct data and IDs
+                await loadEvents();
+                
+                // Find the newly created event in the loaded events
+                // We'll look for an event with the same name as what we just created
+                const eventNameToFind = newEventName.trim();
+                const today = new Date();
+                const formattedDate = today.toLocaleDateString('en-US', { 
+                  month: 'long', 
+                  day: 'numeric'
+                });
+                const expectedEventDisplayName = `${formattedDate} - ${eventNameToFind}`;
+                
+                // Wait a bit for events to load and then find the event
+                setTimeout(() => {
+                  setEvents(currentEvents => {
+                    const matchingEvent = currentEvents.find(event => 
+                      event.name === expectedEventDisplayName || 
+                      event.eventName === eventNameToFind
+                    );
+                    
+                    if (matchingEvent) {
+                      setSelectedEvent(matchingEvent.id);
+                      console.log('Found and selected created event:', matchingEvent);
+                    } else {
+                      console.log('Could not find created event in loaded events, creating fallback');
+                      // Fallback: create the event object manually
+                      const today = new Date();
+                      const month = String(today.getMonth() + 1).padStart(2, '0');
+                      const day = String(today.getDate()).padStart(2, '0');
+                      const year = String(today.getFullYear()).slice(-2);
+                      const dateForSheet = `${month}/${day}/${year}`;
+                      
+                      const fallbackEvent = {
+                        id: `${eventNameToFind.toLowerCase().replace(/\s+/g, '-')}-${today.getTime()}`,
+                        name: expectedEventDisplayName,
+                        eventName: eventNameToFind,
+                        date: today.getFullYear() + '-' + 
+                          String(today.getMonth() + 1).padStart(2, '0') + '-' + 
+                          String(today.getDate()).padStart(2, '0'),
+                        originalSheetDate: dateForSheet // Add the MM/DD/YY format
+                      };
+                      
+                      // Add to events if not already there
+                      const updatedEvents = [...currentEvents, fallbackEvent];
+                      setSelectedEvent(fallbackEvent.id);
+                      return updatedEvents;
+                    }
+                    
+                    return currentEvents;
+                  });
+                }, 500); // Small delay to ensure events have loaded
+                
+                setNewEventName('');
+                setShowCreateEvent(false);
+                
+                alert('Event created successfully! You can now continue to check-in.');
+              } else {
+                throw new Error(data.error || 'Failed to create event');
+              }
+            } catch (error) {
+              console.error('Error creating event:', error);
+              alert('There was an error creating the event. Please try again.');
+            } finally {
+              setIsCreatingEvent(false);
+            }
+          }, [newEventName, SHEETS_URL, loadEvents]);
 
           const saveAthlete = async (athlete) => {
             try {
@@ -132,63 +665,159 @@
 
           const saveCheckIn = async (checkIn) => {
               try {
-                const url = `${SHEETS_URL}?action=checkin&athleteId=${checkIn.athleteId}&name=${encodeURIComponent(checkIn.name)}&time=${encodeURIComponent(checkIn.time)}&date=${encodeURIComponent(checkIn.date)}`;
+                // Find the selected event to get the original event name and date
+                const selectedEventObj = events.find(e => e.id === selectedEvent);
+                const eventNameForBackend = selectedEventObj ? selectedEventObj.eventName : selectedEvent;
+                
+                console.log('=== CHECK-IN DEBUG ===');
+                console.log('Selected event ID:', selectedEvent);
+                console.log('Selected event object:', selectedEventObj);
+                console.log('All available events:', events);
+                
+                // Use the original date from the sheet to ensure exact matching
+                const eventDateForBackend = selectedEventObj && selectedEventObj.originalSheetDate ? 
+                  String(selectedEventObj.originalSheetDate).trim() : 
+                  checkIn.date;
+                
+                console.log('Event date for backend:', eventDateForBackend);
+                console.log('Original check-in date:', checkIn.date);
+                
+                // Convert the date to MM/DD/YY format if it's an ISO string
+                let finalEventDate = eventDateForBackend;
+                if (typeof eventDateForBackend === 'string' && eventDateForBackend.includes('T')) {
+                  const dateObj = new Date(eventDateForBackend);
+                  const month = String(dateObj.getMonth() + 1).padStart(2, '0');
+                  const day = String(dateObj.getDate()).padStart(2, '0');
+                  const year = String(dateObj.getFullYear()).slice(-2);
+                  finalEventDate = `${month}/${day}/${year}`;
+                  console.log('Converted ISO date to MM/DD/YY:', finalEventDate);
+                }
+                
+                console.log('Check-in data for backend:', {
+                  event: eventNameForBackend,
+                  date: finalEventDate,
+                  originalCheckInDate: checkIn.date,
+                  selectedEventObj: selectedEventObj
+                });
+                
+                const url = `${SHEETS_URL}?action=checkin&athleteId=${checkIn.athleteId}&name=${encodeURIComponent(checkIn.name)}&time=${encodeURIComponent(checkIn.time)}&date=${encodeURIComponent(finalEventDate)}&event=${encodeURIComponent(eventNameForBackend)}`;
+                
+                console.log('Full URL:', url);
                 
                 const response = await fetch(url);
                 const data = await response.json();
                 console.log('Check-in response:', data);
+                
+                if (!data.success) {
+                  if (data.error && data.error.includes('already checked in')) {
+                    alert(`${checkIn.name.split(' ')[0]} is already checked in for this event today!`);
+                  } else {
+                    alert(`Error checking in: ${data.error || 'Unknown error'}`);
+                  }
+                  return false; // Return false on failure
+                }
+                
+                // Also update athlete's last visit date
+                await updateAthleteStats(checkIn.athleteId);
+                return true; // Return true on success
               } catch (error) {
                 console.error('Error saving check-in:', error);
+                alert('There was an error processing the check-in. Please try again.');
+                return false; // Return false on error
               }
           };
 
+          const updateAthleteStats = async (athleteId) => {
+            try {
+              const url = `${SHEETS_URL}?action=updateStats&athleteId=${athleteId}&date=${new Date().toISOString().split('T')[0]}`;
+              await fetch(url);
+            } catch (error) {
+              console.error('Error updating athlete stats:', error);
+            }
+          };
+
           const handleWaiverSubmit = async () => {
-            if (!waiverForm.firstName || !waiverForm.lastName || !waiverForm.email || !waiverForm.signature) {
-              alert('Please fill in all required fields and provide your signature');
+            // Enhanced validation
+            const requiredFields = [
+              { field: 'firstName', name: 'First Name' },
+              { field: 'lastName', name: 'Last Name' },
+              { field: 'email', name: 'Email' },
+              { field: 'dateOfBirth', name: 'Date of Birth' },
+              { field: 'signature', name: 'Signature' }
+            ];
+
+            const missingFields = requiredFields.filter(({ field }) => !waiverForm[field]?.trim());
+            
+            if (missingFields.length > 0) {
+              alert(`Please fill in the following required fields: ${missingFields.map(f => f.name).join(', ')}`);
               return;
             }
 
+            // Email validation
+            const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+            if (!emailRegex.test(waiverForm.email)) {
+              alert('Please enter a valid email address');
+              return;
+            }
+
+            // Age validation
             const isMinor = calculateAge(waiverForm.dateOfBirth) < 18;
-            if (isMinor && (!waiverForm.parentSignature || !waiverForm.parentName)) {
-              alert('Parent/Guardian signature required for minors');
+            if (isMinor && (!waiverForm.parentSignature?.trim() || !waiverForm.parentName?.trim())) {
+              alert('Parent/Guardian name and signature are required for participants under 18');
               return;
             }
 
-            const newAthlete = {
-              id: Date.now(),
-              firstName: waiverForm.firstName,
-              lastName: waiverForm.lastName,
-              email: waiverForm.email,
-              phone: waiverForm.phone,
-              dateOfBirth: waiverForm.dateOfBirth,
-              waiverSigned: true,
-              waiverDate: new Date().toISOString().split('T')[0],
-              emergencyContact: waiverForm.emergencyContact,
-              emergencyPhone: waiverForm.emergencyPhone,
-              medicalConditions: waiverForm.medicalConditions,
-              isMinor: isMinor,
-              parentName: isMinor ? waiverForm.parentName : null
-            };
+            // Check for duplicate email
+            const existingAthlete = athletes.find(a => a.email.toLowerCase() === waiverForm.email.toLowerCase());
+            if (existingAthlete) {
+              alert('An athlete with this email address is already registered. Please use a different email or contact the front desk.');
+              return;
+            }
 
-            setAthletes(prev => [...prev, newAthlete]);
-            await saveAthlete(newAthlete);
-            
-            setWaiverForm({
-              firstName: '',
-              lastName: '',
-              email: '',
-              phone: '',
-              dateOfBirth: '',
-              emergencyContact: '',
-              emergencyPhone: '',
-              medicalConditions: '',
-              signature: '',
-              parentSignature: '',
-              parentName: ''
-            });
-            
-            alert('Waiver signed successfully! You can now check in.');
-            setCurrentView('checkin');
+            try {
+              setIsLoading(true);
+              
+              const newAthlete = {
+                id: Date.now(),
+                firstName: waiverForm.firstName.trim(),
+                lastName: waiverForm.lastName.trim(),
+                email: waiverForm.email.toLowerCase().trim(),
+                phone: waiverForm.phone.trim(),
+                dateOfBirth: waiverForm.dateOfBirth,
+                waiverSigned: true,
+                waiverDate: new Date().toISOString().split('T')[0],
+                emergencyContact: waiverForm.emergencyContact.trim(),
+                emergencyPhone: waiverForm.emergencyPhone.trim(),
+                medicalConditions: waiverForm.medicalConditions.trim(),
+                isMinor: isMinor,
+                parentName: isMinor ? waiverForm.parentName.trim() : null
+              };
+
+              setAthletes(prev => [...prev, newAthlete]);
+              await saveAthlete(newAthlete);
+              
+              setWaiverForm({
+                firstName: '',
+                lastName: '',
+                email: '',
+                phone: '',
+                dateOfBirth: '',
+                emergencyContact: '',
+                emergencyPhone: '',
+                medicalConditions: '',
+                signature: '',
+                parentSignature: '',
+                parentName: ''
+              });
+              
+              alert('Waiver signed successfully! You can now check in.');
+              setCurrentView('checkin');
+            } catch (error) {
+              console.error('Error submitting waiver:', error);
+              alert('There was an error submitting your waiver. Please try again.');
+            } finally {
+              setIsLoading(false);
+            }
           };
 
           const calculateAge = (dateOfBirth) => {
@@ -202,48 +831,146 @@
             return age;
           };
 
-          const handleCheckIn = async (athlete) => {
-            const today = new Date().toDateString();
-            const checkInRecord = {
-              athleteId: athlete.id,
-              name: `${athlete.firstName} ${athlete.lastName}`,
-              time: new Date().toLocaleTimeString(),
-              date: today
-            };
-            
-            setCheckedInToday(prev => [...prev, checkInRecord]);
-            await saveCheckIn(checkInRecord);
-            alert(`${athlete.firstName} ${athlete.lastName} checked in successfully!`);
-          };
-
-          const searchAthletes = useCallback(() => {
-            if (!searchQuery.trim()) return [];
-            
-            return athletes.filter(athlete => 
-              `${athlete.firstName} ${athlete.lastName}`.toLowerCase().includes(searchQuery.toLowerCase()) ||
-              athlete.email.toLowerCase().includes(searchQuery.toLowerCase()) ||
-              athlete.phone.includes(searchQuery)
-            );
-          }, [searchQuery, athletes]);
-
           const isCheckedInToday = (athleteId) => {
-            const today = new Date().toDateString();
-            return checkedInToday.some(record => 
-              record.athleteId === athleteId && record.date === today
-            );
+            // Since checkedInToday now only contains today's check-ins for the selected event,
+            // we just need to check if the athlete ID exists in the list
+            return checkedInToday.some(record => record.athleteId === athleteId);
           };
 
-          const handleSearchChange = useCallback((e) => {
-            const cursorPosition = e.target.selectionStart;
-            setSearchQuery(e.target.value);
-            
-            setTimeout(() => {
-              if (searchInputRef.current) {
-                searchInputRef.current.focus();
-                searchInputRef.current.setSelectionRange(cursorPosition, cursorPosition);
-              }
-            }, 0);
-          }, []);
+
+          const WelcomeScreen = () => {
+            return (
+              React.createElement('div', { className: "max-w-2xl mx-auto" },
+                React.createElement('div', { className: "bg-white rounded-lg shadow-lg p-8" },
+                  React.createElement('div', { className: "text-center mb-8" },
+                    React.createElement('div', { className: "text-6xl mb-4" }, "�"),
+                    React.createElement('h2', { className: "text-3xl font-bold text-gray-800 mb-4" }, "Select Your Event"),
+                    React.createElement('p', { className: "text-lg text-gray-600" }, "Choose which event you're checking in for today.")
+                  ),
+                  
+                  React.createElement('div', { className: "mb-8" },
+                    React.createElement('label', { className: "block text-sm font-medium text-gray-700 mb-3" }, "Event Type"),
+                    isLoadingEvents ? (
+                      React.createElement('div', { className: "w-full px-4 py-3 border border-gray-300 rounded-lg text-lg bg-gray-50 flex items-center gap-2" },
+                        React.createElement('div', { className: "animate-spin rounded-full h-4 w-4 border-b-2 border-blue-600" }),
+                        React.createElement('span', null, "Loading today's events...")
+                      )
+                    ) : events.length === 0 ? (
+                      showCreateEvent ? (
+                        React.createElement('div', { className: "space-y-4" },
+                          React.createElement('div', { className: "w-full px-4 py-3 border border-blue-300 rounded-lg text-lg bg-blue-50" },
+                            React.createElement('div', { className: "flex items-center gap-2 text-blue-700 mb-2" },
+                              React.createElement('span', { className: "text-xl" }, "✨"),
+                              React.createElement('span', { className: "font-medium" }, "Create New Event for Today")
+                            ),
+                            React.createElement('p', { className: "text-sm text-blue-600" }, "Enter the name of the event you want to create for today.")
+                          ),
+                          React.createElement('input', {
+                            ref: eventInputRef,
+                            type: "text",
+                            placeholder: "Enter event name (e.g., Open Gym, Volleyball Practice)",
+                            value: newEventName,
+                            onChange: (e) => setNewEventName(e.target.value),
+                            onKeyPress: (e) => {
+                              if (e.key === 'Enter') {
+                                createNewEvent();
+                              }
+                            },
+                            className: "w-full px-4 py-3 border border-gray-300 rounded-lg text-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500",
+                            disabled: isCreatingEvent,
+                            autoFocus: true
+                          }),
+                          React.createElement('div', { className: "flex gap-3" },
+                            React.createElement('button', {
+                              onClick: createNewEvent,
+                              disabled: isCreatingEvent || !newEventName.trim(),
+                              className: `flex-1 py-3 rounded-lg font-semibold transition-all ${
+                                isCreatingEvent || !newEventName.trim()
+                                  ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                                  : 'bg-green-600 hover:bg-green-700 text-white'
+                              }`
+                            }, isCreatingEvent ? "Creating..." : "Create Event"),
+                            React.createElement('button', {
+                              onClick: () => {
+                                setShowCreateEvent(false);
+                                setNewEventName('');
+                              },
+                              disabled: isCreatingEvent,
+                              className: "px-6 py-3 rounded-lg font-semibold bg-gray-500 hover:bg-gray-600 text-white transition-all"
+                            }, "Cancel")
+                          )
+                        )
+                      ) : (
+                        React.createElement('div', { className: "space-y-4" },
+                          React.createElement('div', { className: "w-full px-4 py-3 border border-yellow-300 rounded-lg text-lg bg-yellow-50" },
+                            React.createElement('div', { className: "flex items-center gap-2 text-yellow-700" },
+                              React.createElement('span', { className: "text-xl" }, "📅"),
+                              React.createElement('span', null, "No events scheduled for today")
+                            ),
+                            React.createElement('p', { className: "text-sm text-yellow-600 mt-1" }, "You can create a new event or check back tomorrow.")
+                          ),
+                          React.createElement('button', {
+                            onClick: () => setShowCreateEvent(true),
+                            className: "w-full py-3 rounded-lg font-semibold bg-blue-600 hover:bg-blue-700 text-white transition-all flex items-center justify-center gap-2"
+                          },
+                            React.createElement('span', { className: "text-xl" }, "➕"),
+                            React.createElement('span', null, "Create New Event")
+                          )
+                        )
+                      )
+                    ) : (
+                      React.createElement('select', {
+                        value: selectedEvent,
+                        onChange: (e) => setSelectedEvent(e.target.value),
+                        className: "w-full px-4 py-3 border border-gray-300 rounded-lg text-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                      },
+                        React.createElement('option', { value: "" }, "-- Select Today's Event --"),
+                        events.map(event => 
+                          React.createElement('option', { key: event.id, value: event.id }, event.name)
+                        )
+                      )
+                    )
+                  ),
+                  
+                  React.createElement('div', { className: "text-center" },
+                    events.length === 0 && !isLoadingEvents && !showCreateEvent ? (
+                      React.createElement('button', {
+                        onClick: () => setCurrentView('admin'),
+                        className: "px-8 py-4 rounded-lg text-xl font-semibold transition-all transform hover:scale-105 shadow-lg bg-gray-600 hover:bg-gray-700 text-white"
+                      }, "Staff Admin Panel")
+                    ) : showCreateEvent || events.length === 0 ? (
+                      null // Don't show continue button when creating event or no events
+                    ) : (
+                      React.createElement('button', {
+                        onClick: () => {
+                          if (!selectedEvent) {
+                            alert('Please select an event before continuing.');
+                            return;
+                          }
+                          loadAthletes();
+                          setCurrentView('checkin');
+                        },
+                        disabled: !selectedEvent || isLoadingEvents,
+                        className: `px-8 py-4 rounded-lg text-xl font-semibold transition-all transform hover:scale-105 shadow-lg ${
+                          selectedEvent && !isLoadingEvents
+                            ? 'bg-blue-600 hover:bg-blue-700 text-white' 
+                            : 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                        }`
+                      }, "Continue to Check-In")
+                    )
+                  ),
+                  
+                  React.createElement('div', { className: "mt-8 pt-6 border-t border-gray-200 text-center" },
+                    React.createElement('p', { className: "text-sm text-gray-500 mb-4" }, "Need help? Contact our front desk staff."),
+                    React.createElement('button', {
+                      onClick: () => setCurrentView('admin'),
+                      className: "text-gray-400 hover:text-gray-600 text-sm underline"
+                    }, "Staff Admin Panel")
+                  )
+                )
+              )
+            );
+          };
 
           const WaiverForm = () => (
             React.createElement('div', { className: "max-w-2xl mx-auto bg-white p-6 rounded-lg shadow-lg" },
@@ -353,18 +1080,327 @@
 
                 React.createElement('button', {
                   onClick: handleWaiverSubmit,
-                  className: "w-full bg-blue-600 text-white py-3 rounded font-semibold hover:bg-blue-700"
-                }, "Sign Waiver & Complete Registration")
+                  disabled: isLoading,
+                  className: `w-full py-3 rounded font-semibold text-white ${
+                    isLoading 
+                      ? 'bg-gray-400 cursor-not-allowed' 
+                      : 'bg-blue-600 hover:bg-blue-700'
+                  }`
+                }, isLoading ? "Processing..." : "Sign Waiver & Complete Registration")
               )
             )
           );
 
-          const CheckInSystem = () => (
-            React.createElement('div', { className: "max-w-4xl mx-auto" },
-              React.createElement('div', { className: "bg-white rounded-lg shadow-lg p-6 mb-6" },
-                React.createElement('h2', { className: "text-2xl font-bold mb-4 text-center" }, "Gym Check-In System"),
+          const CheckInSystem = React.memo(() => {
+            const [searchQuery, setSearchQuery] = useState('');
+            const [showMissingDataForm, setShowMissingDataForm] = useState(false);
+            const [athleteToUpdate, setAthleteToUpdate] = useState(null);
+            const [missingFields, setMissingFields] = useState([]);
+            const [missingDataForm, setMissingDataForm] = useState({
+              firstName: '',
+              lastName: '',
+              email: '',
+              dateOfBirth: ''
+            });
+            const [isUpdatingData, setIsUpdatingData] = useState(false);
+            const searchInputRef = useRef(null);
+            
+            const handleSearchChange = useCallback((e) => {
+              setSearchQuery(e.target.value);
+            }, []);
+            
+            const searchAthletes = useCallback(() => {
+              if (!searchQuery.trim()) return [];
+              
+              return athletes.filter(athlete => 
+                `${athlete.firstName} ${athlete.lastName}`.toLowerCase().includes(searchQuery.toLowerCase()) ||
+                athlete.email.toLowerCase().includes(searchQuery.toLowerCase()) ||
+                athlete.phone.includes(searchQuery)
+              );
+            }, [searchQuery, athletes]);
+            
+            // Check for missing required fields
+            const checkMissingFields = (athlete) => {
+              const requiredFields = ['firstName', 'lastName', 'email', 'dateOfBirth'];
+              const missingFields = [];
+              
+              requiredFields.forEach(field => {
+                if (!athlete[field] || String(athlete[field]).trim() === '') {
+                  missingFields.push(field);
+                }
+              });
+              
+              return missingFields;
+            };
+            
+            // Update athlete data with missing information
+            const updateAthleteData = async (athleteId, updatedData) => {
+              try {
+                console.log('Updating athlete:', athleteId, 'with data:', updatedData);
                 
-                React.createElement('div', { className: "flex gap-4 mb-6" },
+                // Use GET request with URL parameters instead of POST to avoid CORS issues
+                const params = new URLSearchParams({
+                  action: 'updateAthlete',
+                  athleteId: athleteId,
+                  ...updatedData
+                });
+                
+                const url = `${SHEETS_URL}?${params.toString()}`;
+                console.log('Update URL:', url);
+                
+                const response = await fetch(url);
+                console.log('Response status:', response.status);
+                
+                const result = await response.json();
+                console.log('Update response:', result);
+                
+                if (result.success) {
+                  // Refresh athletes list to get updated data
+                  console.log('Refreshing athletes list...');
+                  await loadAthletes();
+                  return true;
+                } else {
+                  throw new Error(result.error || 'Failed to update athlete data');
+                }
+              } catch (error) {
+                console.error('Error updating athlete:', error);
+                alert('Error updating athlete data: ' + error.message);
+                return false;
+              }
+            };
+            
+            // Handle missing data form submission
+            const handleMissingDataSubmit = async (e) => {
+              e.preventDefault();
+              console.log('Form submitted with data:', missingDataForm);
+              console.log('Athlete to update:', athleteToUpdate);
+              console.log('Missing fields:', missingFields);
+              
+              setIsUpdatingData(true);
+              
+              try {
+                // Validate required fields are filled
+                console.log('Starting validation...');
+                const requiredData = {};
+                
+                console.log('Missing fields to validate:', missingFields);
+                console.log('Current form data:', missingDataForm);
+                
+                missingFields.forEach(field => {
+                  console.log(`Checking field ${field}: "${missingDataForm[field]}"`);
+                  if (missingDataForm[field] && missingDataForm[field].trim() !== '') {
+                    requiredData[field] = missingDataForm[field].trim();
+                    console.log(`Field ${field} is valid`);
+                  } else {
+                    console.log(`Field ${field} is missing or empty`);
+                    throw new Error(`${field} is required`);
+                  }
+                });
+                
+                console.log('Validation passed. Required data:', requiredData);
+                
+                console.log('Sending update with data:', requiredData);
+                
+                // Update athlete data
+                const success = await updateAthleteData(athleteToUpdate.id, requiredData);
+                console.log('Update success:', success);
+                
+                if (success) {
+                  // Create updated athlete object with the new data
+                  const updatedAthlete = {
+                    ...athleteToUpdate,
+                    ...requiredData
+                  };
+                  
+                  console.log('Created updated athlete object:', updatedAthlete);
+                  
+                  // Close form
+                  setShowMissingDataForm(false);
+                  setAthleteToUpdate(null);
+                  setMissingFields([]);
+                  
+                  // Proceed with check-in using the updated athlete data immediately
+                  console.log('Proceeding with check-in for updated athlete');
+                  await handleCheckIn(updatedAthlete);
+                } else {
+                  console.error('Update failed');
+                }
+              } catch (error) {
+                console.error('Error submitting missing data:', error);
+                alert('Error updating athlete data: ' + error.message);
+              } finally {
+                setIsUpdatingData(false);
+              }
+            };
+            
+            // Handle check-in process
+            const handleCheckIn = async (athlete) => {
+              try {
+                console.log('Starting check-in for athlete:', athlete);
+                console.log('Selected event:', selectedEvent);
+                
+                // Check if an event is selected
+                if (!selectedEvent) {
+                  alert('Please select an event first.');
+                  return;
+                }
+                
+                // Check for missing required fields first
+                const missing = checkMissingFields(athlete);
+                console.log('Missing fields:', missing);
+                
+                if (missing.length > 0) {
+                  console.log('Found missing fields, showing form');
+                  // Show form to collect missing data
+                  setAthleteToUpdate(athlete);
+                  setMissingFields(missing);
+                  
+                  // Pre-fill form with existing data
+                  setMissingDataForm({
+                    firstName: athlete.firstName || '',
+                    lastName: athlete.lastName || '',
+                    email: athlete.email || '',
+                    dateOfBirth: athlete.dateOfBirth || ''
+                  });
+                  
+                  setShowMissingDataForm(true);
+                  return; // Don't proceed with check-in - this is normal, not an error
+                }
+                
+                console.log('No missing fields, proceeding with check-in');
+                // Set loading state for this specific athlete
+                setCheckingInAthleteId(athlete.id);
+                
+                const today = new Date();
+                // Format date to match the Events sheet format (MM/DD/YY)
+                const month = String(today.getMonth() + 1).padStart(2, '0');
+                const day = String(today.getDate()).padStart(2, '0');
+                const year = String(today.getFullYear()).slice(-2);
+                const dateForSheet = `${month}/${day}/${year}`;
+                
+                // Get the selected event name for the check-in record
+                const selectedEventObj = events.find(e => e.id === selectedEvent);
+                const eventNameForRecord = selectedEventObj ? selectedEventObj.eventName : selectedEvent;
+                
+                const checkInRecord = {
+                  athleteId: athlete.id,
+                  name: `${athlete.firstName} ${athlete.lastName}`,
+                  time: new Date().toLocaleTimeString(),
+                  date: dateForSheet,
+                  event: eventNameForRecord || 'open-gym'
+                };
+
+                // Immediately update the UI for instant feedback
+                console.log('Adding optimistic check-in to UI:', checkInRecord);
+                setCheckedInToday(prev => [...prev, checkInRecord]);
+                
+                // Play pleasant success sound
+                try {
+                  const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                  
+                  // Create a gentle, pleasant chime sound
+                  const playTone = (frequency, startTime, duration, volume = 0.1) => {
+                    const oscillator = audioContext.createOscillator();
+                    const gainNode = audioContext.createGain();
+                    
+                    oscillator.connect(gainNode);
+                    gainNode.connect(audioContext.destination);
+                    
+                    oscillator.frequency.value = frequency;
+                    oscillator.type = 'sine'; // Soft, pure tone
+                    
+                    // Gentle volume envelope for smooth, pleasant sound
+                    gainNode.gain.setValueAtTime(0, startTime);
+                    gainNode.gain.linearRampToValueAtTime(volume, startTime + 0.02);
+                    gainNode.gain.exponentialRampToValueAtTime(0.001, startTime + duration);
+                    
+                    oscillator.start(startTime);
+                    oscillator.stop(startTime + duration);
+                  };
+                  
+                  // Play a gentle ascending chime (C-E-G major chord)
+                  const now = audioContext.currentTime;
+                  playTone(523.25, now, 0.6, 0.08);        // C5 - soft and gentle
+                  playTone(659.25, now + 0.1, 0.7, 0.06);  // E5 - slightly delayed
+                  playTone(783.99, now + 0.2, 0.8, 0.04);  // G5 - even softer
+                  
+                } catch (e) {
+                  console.log('Could not play success sound:', e);
+                }
+                
+                // Show immediate success notification
+                const successNotification = document.createElement('div');
+                successNotification.id = 'success-notification';
+                successNotification.className = 'fixed top-4 left-1/2 transform -translate-x-1/2 bg-green-500 text-white px-6 py-3 rounded-lg shadow-lg z-50 font-semibold';
+                successNotification.innerHTML = `✅ ${athlete.firstName} ${athlete.lastName} checked in successfully!`;
+                document.body.appendChild(successNotification);
+                
+                // Remove notification after 3 seconds
+                setTimeout(() => {
+                  const notification = document.getElementById('success-notification');
+                  if (notification) {
+                    notification.remove();
+                  }
+                }, 3000);
+                
+                // Clear search term and loading state immediately
+                setSearchQuery('');
+                setCheckingInAthleteId(null);
+
+                // Save to backend and refresh the list from server
+                try {
+                  const success = await saveCheckIn(checkInRecord);
+                  if (success) {
+                    console.log('Check-in saved successfully, waiting 3 seconds then refreshing from server...');
+                    // Add a longer delay to ensure Google Sheets has processed the write operation
+                    await new Promise(resolve => setTimeout(resolve, 3000));
+                    console.log('Now refreshing check-ins from server...');
+                    // Refresh the check-ins list from the server to ensure accuracy
+                    await loadTodaysCheckIns();
+                  } else {
+                    console.error('Backend save failed');
+                    // Remove the optimistic update if save failed
+                    setCheckedInToday(prev => prev.filter(item => 
+                      item.athleteId !== checkInRecord.athleteId || 
+                      item.time !== checkInRecord.time
+                    ));
+                  }
+                } catch (error) {
+                  console.error('Backend save failed:', error);
+                  // Remove the optimistic update if save failed
+                  setCheckedInToday(prev => prev.filter(item => 
+                    item.athleteId !== checkInRecord.athleteId || 
+                    item.time !== checkInRecord.time
+                  ));
+                }
+              } catch (error) {
+                console.error('Check-in error:', error);
+                alert('There was an error processing the check-in. Please try again.');
+                // Clear loading state on error
+                setCheckingInAthleteId(null);
+              }
+            };
+            
+            // Handle form input changes
+            const handleMissingDataChange = (field, value) => {
+              setMissingDataForm(prev => ({
+                ...prev,
+                [field]: value
+              }));
+            };
+            
+            return (
+              React.createElement('div', { className: "max-w-4xl mx-auto" },
+                React.createElement('div', { className: "bg-white rounded-lg shadow-lg p-6 mb-6" },
+                  selectedEvent && (
+                    React.createElement('div', { className: "mb-4 p-3 bg-blue-50 border border-blue-200 rounded-lg" },
+                      React.createElement('p', { className: "text-blue-800 font-medium" },
+                        `Checking in for: ${events.find(e => e.id === selectedEvent)?.name || selectedEvent}`
+                      )
+                    )
+                  ),
+                  
+                  React.createElement('div', { className: "flex gap-4 mb-6" },
                   React.createElement('input', {
                     ref: searchInputRef,
                     type: "text",
@@ -374,69 +1410,180 @@
                     className: "flex-1 border rounded px-4 py-2",
                     autoComplete: "off",
                     spellCheck: "false",
-                    autoFocus: false
+                    autoFocus: false,
+                    disabled: isLoading
                   }),
                   React.createElement('button', {
                     onClick: loadAthletes,
-                    className: "bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700",
+                    disabled: isLoading,
+                    className: `px-4 py-2 rounded text-white ${isLoading ? 'bg-gray-400 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700'}`,
                     title: "Refresh athlete list from Google Sheets"
-                  }, "Refresh"),
+                  }, isLoading ? "Loading..." : "Refresh"),
                   React.createElement('button', {
-                    onClick: () => setCurrentView('waiver'),
-                    className: "bg-green-600 text-white px-6 py-2 rounded hover:bg-green-700"
-                  }, "Sign Waiver")
+                    onClick: () => {
+                      window.open('https://www.jotform.com/sign/251831913735055/invite/01jz7jm7spc4436bee49810dbf', '_blank');
+                    },
+                    className: "bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded font-semibold transition-colors flex items-center gap-2",
+                    title: "Add a new athlete"
+                  },
+                    React.createElement('span', { className: "text-lg" }, "📝"),
+                    React.createElement('span', null, "New Athlete")
+                  )
+                ),
+
+                // Error display
+                error && (
+                  React.createElement('div', { className: "mb-4 p-4 bg-red-50 border border-red-200 rounded-lg" },
+                    React.createElement('div', { className: "flex items-center gap-2" },
+                      React.createElement('span', { className: "text-red-600" }, "⚠️"),
+                      React.createElement('span', { className: "text-red-800 font-medium" }, "Error: "),
+                      React.createElement('span', { className: "text-red-700" }, error)
+                    ),
+                    React.createElement('button', {
+                      onClick: () => setError(null),
+                      className: "mt-2 text-sm text-red-600 underline hover:text-red-800"
+                    }, "Dismiss")
+                  )
+                ),
+
+                // Missing Data Form
+                showMissingDataForm && (
+                  React.createElement('div', { className: "mb-6 p-6 bg-yellow-50 border border-yellow-200 rounded-lg" },
+                    React.createElement('h3', { className: "text-lg font-semibold text-yellow-800 mb-4" }, "Missing Required Information"),
+                    React.createElement('p', { className: "text-yellow-700 mb-4" }, 
+                      `Please provide the missing information for ${athleteToUpdate?.firstName || 'this athlete'} ${athleteToUpdate?.lastName || ''} before checking in:`
+                    ),
+                    React.createElement('form', { onSubmit: handleMissingDataSubmit },
+                      React.createElement('div', { className: "grid grid-cols-1 md:grid-cols-2 gap-4 mb-4" },
+                        missingFields.includes('firstName') && React.createElement('div', null,
+                          React.createElement('label', { className: "block text-sm font-medium text-gray-700 mb-1" }, "First Name *"),
+                          React.createElement('input', {
+                            type: "text",
+                            value: missingDataForm.firstName,
+                            onChange: (e) => handleMissingDataChange('firstName', e.target.value),
+                            className: "w-full border border-gray-300 rounded px-3 py-2",
+                            required: true
+                          })
+                        ),
+                        missingFields.includes('lastName') && React.createElement('div', null,
+                          React.createElement('label', { className: "block text-sm font-medium text-gray-700 mb-1" }, "Last Name *"),
+                          React.createElement('input', {
+                            type: "text",
+                            value: missingDataForm.lastName,
+                            onChange: (e) => handleMissingDataChange('lastName', e.target.value),
+                            className: "w-full border border-gray-300 rounded px-3 py-2",
+                            required: true
+                          })
+                        ),
+                        missingFields.includes('email') && React.createElement('div', null,
+                          React.createElement('label', { className: "block text-sm font-medium text-gray-700 mb-1" }, "Email *"),
+                          React.createElement('input', {
+                            type: "email",
+                            value: missingDataForm.email,
+                            onChange: (e) => handleMissingDataChange('email', e.target.value),
+                            className: "w-full border border-gray-300 rounded px-3 py-2",
+                            required: true
+                          })
+                        ),
+                        missingFields.includes('dateOfBirth') && React.createElement('div', null,
+                          React.createElement('label', { className: "block text-sm font-medium text-gray-700 mb-1" }, "Date of Birth *"),
+                          React.createElement('input', {
+                            type: "date",
+                            value: missingDataForm.dateOfBirth,
+                            onChange: (e) => handleMissingDataChange('dateOfBirth', e.target.value),
+                            className: "w-full border border-gray-300 rounded px-3 py-2",
+                            required: true
+                          })
+                        )
+                      ),
+                      React.createElement('div', { className: "flex gap-3" },
+                        React.createElement('button', {
+                          type: "submit",
+                          disabled: isUpdatingData,
+                          className: `px-4 py-2 rounded font-medium text-white ${isUpdatingData ? 'bg-gray-400 cursor-not-allowed' : 'bg-green-600 hover:bg-green-700'}`
+                        }, isUpdatingData ? "Updating..." : "Update & Check In"),
+                        React.createElement('button', {
+                          type: "button",
+                          onClick: () => setShowMissingDataForm(false),
+                          disabled: isUpdatingData,
+                          className: `px-4 py-2 rounded font-medium text-white ${isUpdatingData ? 'bg-gray-400 cursor-not-allowed' : 'bg-gray-500 hover:bg-gray-600'}`
+                        }, "Cancel")
+                      )
+                    )
+                  )
+                ),
+
+                // Loading indicator
+                isLoading && (
+                  React.createElement('div', { className: "mb-4 text-center py-4" },
+                    React.createElement('div', { className: "inline-flex items-center gap-2" },
+                      React.createElement('div', { className: "animate-spin rounded-full h-4 w-4 border-b-2 border-blue-600" }),
+                      React.createElement('span', { className: "text-gray-600" }, "Loading athletes...")
+                    )
+                  )
                 ),
 
                 React.createElement('div', { className: "mb-4 text-sm text-gray-600" },
                   `Athletes loaded: ${athletes.length} | ${athletes.filter(a => a.waiverSigned).length} with signed waivers`
                 ),
 
-                searchQuery && (
+                searchQuery && !isLoading && (
                   React.createElement('div', { className: "space-y-3" },
                     searchAthletes().length === 0 ? (
                       React.createElement('div', { className: "text-center py-8" },
-                        React.createElement('div', { className: "mx-auto h-12 w-12 text-gray-400 mb-4" }, "!"),
+                        React.createElement('div', { className: "mx-auto h-12 w-12 text-gray-400 mb-4 text-4xl" }, "🔍"),
                         React.createElement('p', { className: "text-gray-600 mb-4" }, "No athlete found with that information."),
-                        React.createElement('button', {
-                          onClick: () => setCurrentView('waiver'),
-                          className: "bg-blue-600 text-white px-6 py-2 rounded hover:bg-blue-700"
-                        }, "Sign Waiver to Register")
+                        React.createElement('p', { className: "text-sm text-gray-500" }, "New athletes can use the 'New Athlete' button above.")
                       )
                     ) : (
                       searchAthletes().map(athlete => (
-                        React.createElement('div', { key: athlete.id, className: "border rounded-lg p-4 flex items-center justify-between" },
+                        React.createElement('div', { key: athlete.id, className: "border rounded-lg p-4 flex items-center justify-between hover:bg-gray-50 transition-colors" },
                           React.createElement('div', { className: "flex items-center gap-4" },
-                            React.createElement('div', { className: "h-10 w-10 text-gray-400" }, "👤"),
+                            React.createElement('div', { className: "h-10 w-10 text-gray-400 text-2xl flex items-center justify-center" }, "👤"),
                             React.createElement('div', null,
-                              React.createElement('h3', { className: "font-semibold" }, `${athlete.firstName} ${athlete.lastName}`),
+                              React.createElement('h3', { className: "font-semibold text-lg" }, `${athlete.firstName} ${athlete.lastName}`),
                               React.createElement('p', { className: "text-sm text-gray-600" }, athlete.email),
-                              React.createElement('p', { className: "text-xs text-gray-500" },
-                                `Waiver: ${athlete.waiverSigned ? `Signed ${athlete.waiverDate}` : 'Not signed'}`
+                              athlete.phone && React.createElement('p', { className: "text-sm text-gray-500" }, athlete.phone),
+                              React.createElement('div', { className: "flex gap-4 text-xs text-gray-500 mt-1" },
+                                React.createElement('span', null, `Waiver: ${athlete.waiverSigned ? `✓ Signed` : '✗ Missing'}`),
+                                athlete.lastVisit && React.createElement('span', null, `Last Visit: ${athlete.lastVisit}`)
                               )
                             )
                           ),
                           
                           React.createElement('div', { className: "flex items-center gap-3" },
-                            athlete.waiverSigned ? 
-                              React.createElement('div', { className: "h-6 w-6 text-green-500" }, "✓") :
-                              React.createElement('div', { className: "h-6 w-6 text-red-500" }, "✗"),
+                            athlete.waiverSigned ? (
+                              // Check if athlete has missing required data
+                              checkMissingFields(athlete).length > 0 ? 
+                                React.createElement('div', { className: "h-6 w-6 text-yellow-500 text-xl" }, "⚠️") :
+                                React.createElement('div', { className: "h-6 w-6 text-green-500 text-xl" }, "✓")
+                            ) :
+                              React.createElement('div', { className: "h-6 w-6 text-red-500 text-xl" }, "✗"),
                             
                             athlete.waiverSigned ? (
                               isCheckedInToday(athlete.id) ? (
-                                React.createElement('div', { className: "bg-gray-100 text-gray-600 px-4 py-2 rounded" },
-                                  "Already Checked In"
+                                React.createElement('div', { className: "bg-green-100 text-green-700 px-4 py-2 rounded font-medium border border-green-300" },
+                                  "✅ Checked In"
+                                )
+                              ) : checkingInAthleteId === athlete.id ? (
+                                React.createElement('div', { className: "bg-blue-100 text-blue-600 px-4 py-2 rounded font-medium" },
+                                  "⏳ Checking In..."
                                 )
                               ) : (
+                                // Make button yellow if athlete has missing data
                                 React.createElement('button', {
                                   onClick: () => handleCheckIn(athlete),
-                                  className: "bg-green-600 text-white px-6 py-2 rounded hover:bg-green-700"
-                                }, "Check In")
+                                  disabled: false,
+                                  className: checkMissingFields(athlete).length > 0 
+                                    ? "bg-yellow-500 text-white px-6 py-2 rounded hover:bg-yellow-600 font-medium transition-colors"
+                                    : "bg-green-600 text-white px-6 py-2 rounded hover:bg-green-700 font-medium transition-colors"
+                                }, checkMissingFields(athlete).length > 0 ? "Complete Profile & Check In" : "Check In")
                               )
                             ) : (
                               React.createElement('button', {
-                                onClick: () => setCurrentView('waiver'),
-                                className: "bg-red-600 text-white px-6 py-2 rounded hover:bg-red-700"
-                              }, "Sign Waiver First")
+                                onClick: () => window.open('https://www.jotform.com/sign/251831913735055/invite/01jz7jm7spc4436bee49810dbf', '_blank'),
+                                className: "bg-red-500 text-white px-4 py-2 rounded hover:bg-red-600 font-medium transition-colors cursor-pointer"
+                              }, "Sign Waiver")
                             )
                           )
                         )
@@ -446,120 +1593,250 @@
                 )
               ),
 
-              checkedInToday.length > 0 && (
-                React.createElement('div', { className: "bg-white rounded-lg shadow-lg p-6" },
-                  React.createElement('h3', { className: "text-lg font-semibold mb-4 flex items-center gap-2" },
-                    React.createElement('div', { className: "h-5 w-5" }, "🕐"),
-                    `Today's Check-ins (${checkedInToday.length})`
-                  ),
-                  React.createElement('div', { className: "space-y-2" },
+              React.createElement('div', { className: "bg-white rounded-lg shadow-lg p-6" },
+                React.createElement('h3', { className: "text-lg font-semibold mb-4 flex items-center gap-2" },
+                  React.createElement('div', { className: "h-5 w-5 text-xl" }, "🕐"),
+                  `Today's Check-ins (${checkedInToday.length})`
+                ),
+                (() => {
+                  console.log('DEBUG: Current checkedInToday state:', checkedInToday);
+                  return null;
+                })(),
+                React.createElement('div', { className: "space-y-2 max-h-60 overflow-y-auto" },
+                  checkedInToday.length > 0 ? (
                     checkedInToday.map((record, index) => (
-                      React.createElement('div', { key: index, className: "flex justify-between items-center py-2 border-b" },
+                      React.createElement('div', { key: index, className: "flex justify-between items-center py-2 border-b last:border-b-0" },
                         React.createElement('span', { className: "font-medium" }, record.name),
                         React.createElement('span', { className: "text-sm text-gray-600" }, record.time)
                       )
                     ))
+                  ) : (
+                    React.createElement('div', { className: "text-gray-500 text-center py-4" }, "No check-ins yet today")
                   )
                 )
               )
             )
-          );
+          ); // Added missing closing for return statement
+        });
 
-          const AdminPanel = () => (
-            React.createElement('div', { className: "max-w-6xl mx-auto" },
+          const AdminPanel = () => {
+            // Calculate insights
+            const totalAthletes = athletes.length;
+            const signedWaivers = athletes.filter(a => a.waiverSigned).length;
+            const todaysCheckIns = checkedInToday.length;
+            const missingWaivers = totalAthletes - signedWaivers;
+            const incompleteProfiles = athletes.filter(a => {
+              const missing = ['firstName', 'lastName', 'email', 'dateOfBirth'].filter(field => 
+                !a[field] || String(a[field]).trim() === ''
+              );
+              return missing.length > 0;
+            }).length;
+            
+            // Calculate age demographics
+            const minors = athletes.filter(a => {
+              if (!a.dateOfBirth) return false;
+              const age = calculateAge(a.dateOfBirth);
+              return age < 18;
+            }).length;
+            
+            // Recent activity (last 30 days)
+            const thirtyDaysAgo = new Date();
+            thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+            const recentVisitors = athletes.filter(a => {
+              if (!a.lastVisit) return false;
+              const lastVisit = new Date(a.lastVisit);
+              return lastVisit >= thirtyDaysAgo;
+            }).length;
+            
+            // Most active times (based on today's check-ins)
+            const checkInTimes = checkedInToday.map(record => {
+              const time = new Date(`1970-01-01 ${record.time}`);
+              return time.getHours();
+            });
+            
+            const timeSlots = {
+              'Morning (6-12)': checkInTimes.filter(h => h >= 6 && h < 12).length,
+              'Afternoon (12-17)': checkInTimes.filter(h => h >= 12 && h < 17).length,
+              'Evening (17-22)': checkInTimes.filter(h => h >= 17 && h < 22).length,
+              'Night (22-6)': checkInTimes.filter(h => h >= 22 || h < 6).length
+            };
+            
+            return React.createElement('div', { className: "max-w-6xl mx-auto" },
               React.createElement('div', { className: "bg-white rounded-lg shadow-lg p-6" },
-                React.createElement('h2', { className: "text-2xl font-bold mb-6" }, "Admin Panel"),
+                React.createElement('div', { className: "flex justify-between items-center mb-6" },
+                  React.createElement('h2', { className: "text-3xl font-bold text-gray-800" }, "📊 Admin Dashboard"),
+                  React.createElement('button', {
+                    onClick: () => setCurrentView('welcome'),
+                    className: "bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600 transition-colors"
+                  }, "← Back to Check-In")
+                ),
                 
-                React.createElement('div', { className: "grid grid-cols-1 md:grid-cols-3 gap-6 mb-8" },
-                  React.createElement('div', { className: "bg-blue-50 p-4 rounded-lg" },
-                    React.createElement('h3', { className: "font-semibold text-blue-800" }, "Total Athletes"),
-                    React.createElement('p', { className: "text-2xl font-bold text-blue-600" }, athletes.length)
+                // Key Metrics Row
+                React.createElement('div', { className: "grid grid-cols-2 md:grid-cols-4 gap-4 mb-8" },
+                  React.createElement('div', { className: "bg-gradient-to-r from-blue-500 to-blue-600 text-white p-4 rounded-lg" },
+                    React.createElement('div', { className: "text-2xl font-bold" }, totalAthletes),
+                    React.createElement('div', { className: "text-blue-100" }, "Total Athletes"),
+                    React.createElement('div', { className: "text-sm mt-1" }, `${recentVisitors} active (30 days)`)
                   ),
-                  React.createElement('div', { className: "bg-green-50 p-4 rounded-lg" },
-                    React.createElement('h3', { className: "font-semibold text-green-800" }, "Waivers Signed"),
-                    React.createElement('p', { className: "text-2xl font-bold text-green-600" },
-                      athletes.filter(a => a.waiverSigned).length
-                    )
+                  React.createElement('div', { className: "bg-gradient-to-r from-green-500 to-green-600 text-white p-4 rounded-lg" },
+                    React.createElement('div', { className: "text-2xl font-bold" }, todaysCheckIns),
+                    React.createElement('div', { className: "text-green-100" }, "Today's Check-ins"),
+                    React.createElement('div', { className: "text-sm mt-1" }, "Live count")
                   ),
-                  React.createElement('div', { className: "bg-purple-50 p-4 rounded-lg" },
-                    React.createElement('h3', { className: "font-semibold text-purple-800" }, "Today's Check-ins"),
-                    React.createElement('p', { className: "text-2xl font-bold text-purple-600" }, checkedInToday.length)
+                  React.createElement('div', { className: "bg-gradient-to-r from-purple-500 to-purple-600 text-white p-4 rounded-lg" },
+                    React.createElement('div', { className: "text-2xl font-bold" }, `${Math.round((signedWaivers/totalAthletes)*100)}%`),
+                    React.createElement('div', { className: "text-purple-100" }, "Waiver Completion"),
+                    React.createElement('div', { className: "text-sm mt-1" }, `${signedWaivers}/${totalAthletes} signed`)
+                  ),
+                  React.createElement('div', { className: "bg-gradient-to-r from-orange-500 to-orange-600 text-white p-4 rounded-lg" },
+                    React.createElement('div', { className: "text-2xl font-bold" }, minors),
+                    React.createElement('div', { className: "text-orange-100" }, "Minor Athletes"),
+                    React.createElement('div', { className: "text-sm mt-1" }, "Require parent consent")
                   )
                 ),
-
-                React.createElement('div', { className: "overflow-x-auto" },
-                  React.createElement('table', { className: "w-full border-collapse border border-gray-300" },
-                    React.createElement('thead', { className: "bg-gray-50" },
-                      React.createElement('tr', null,
-                        React.createElement('th', { className: "border border-gray-300 px-4 py-2 text-left" }, "Name"),
-                        React.createElement('th', { className: "border border-gray-300 px-4 py-2 text-left" }, "Email"),
-                        React.createElement('th', { className: "border border-gray-300 px-4 py-2 text-left" }, "Phone"),
-                        React.createElement('th', { className: "border border-gray-300 px-4 py-2 text-left" }, "Waiver Status"),
-                        React.createElement('th', { className: "border border-gray-300 px-4 py-2 text-left" }, "Waiver Date")
-                      )
+                
+                // Action Items Section
+                React.createElement('div', { className: "grid grid-cols-1 md:grid-cols-2 gap-6 mb-8" },
+                  React.createElement('div', { className: "bg-red-50 border border-red-200 rounded-lg p-4" },
+                    React.createElement('h3', { className: "text-lg font-semibold text-red-800 mb-3 flex items-center gap-2" },
+                      React.createElement('span', null, "⚠️"),
+                      "Action Required"
                     ),
-                    React.createElement('tbody', null,
-                      athletes.map(athlete => (
-                        React.createElement('tr', { key: athlete.id, className: "hover:bg-gray-50" },
-                          React.createElement('td', { className: "border border-gray-300 px-4 py-2" },
-                            `${athlete.firstName} ${athlete.lastName}`,
-                            athlete.isMinor && React.createElement('span', { className: "text-xs bg-yellow-200 px-1 rounded ml-2" }, "Minor")
-                          ),
-                          React.createElement('td', { className: "border border-gray-300 px-4 py-2" }, athlete.email),
-                          React.createElement('td', { className: "border border-gray-300 px-4 py-2" }, athlete.phone),
-                          React.createElement('td', { className: "border border-gray-300 px-4 py-2" },
-                            athlete.waiverSigned ? (
-                              React.createElement('span', { className: "text-green-600 font-semibold" }, "✓ Signed")
-                            ) : (
-                              React.createElement('span', { className: "text-red-600 font-semibold" }, "✗ Not Signed")
-                            )
-                          ),
-                          React.createElement('td', { className: "border border-gray-300 px-4 py-2" }, athlete.waiverDate || 'N/A')
+                    React.createElement('div', { className: "space-y-2" },
+                      missingWaivers > 0 && React.createElement('div', { className: "flex justify-between" },
+                        React.createElement('span', { className: "text-red-700" }, "Missing Waivers:"),
+                        React.createElement('span', { className: "font-bold text-red-800" }, missingWaivers)
+                      ),
+                      incompleteProfiles > 0 && React.createElement('div', { className: "flex justify-between" },
+                        React.createElement('span', { className: "text-red-700" }, "Incomplete Profiles:"),
+                        React.createElement('span', { className: "font-bold text-red-800" }, incompleteProfiles)
+                      ),
+                      (missingWaivers === 0 && incompleteProfiles === 0) && 
+                        React.createElement('div', { className: "text-green-600 font-medium" }, "✅ All athletes have complete profiles!")
+                    )
+                  ),
+                  
+                  React.createElement('div', { className: "bg-blue-50 border border-blue-200 rounded-lg p-4" },
+                    React.createElement('h3', { className: "text-lg font-semibold text-blue-800 mb-3 flex items-center gap-2" },
+                      React.createElement('span', null, "🕒"),
+                      "Today's Activity"
+                    ),
+                    React.createElement('div', { className: "space-y-2" },
+                      Object.entries(timeSlots).map(([period, count]) => (
+                        React.createElement('div', { key: period, className: "flex justify-between items-center" },
+                          React.createElement('span', { className: "text-blue-700" }, period),
+                          React.createElement('div', { className: "flex items-center gap-2" },
+                            React.createElement('div', { 
+                              className: "bg-blue-200 h-2 rounded-full",
+                              style: { width: `${Math.max(20, (count/Math.max(1, todaysCheckIns)) * 100)}px` }
+                            }),
+                            React.createElement('span', { className: "font-bold text-blue-800 text-sm" }, count)
+                          )
                         )
                       ))
                     )
                   )
+                ),
+                
+                // Athletes Table with Enhanced Features
+                React.createElement('div', { className: "bg-gray-50 rounded-lg p-4" },
+                  React.createElement('h3', { className: "text-xl font-semibold mb-4 text-gray-800" }, "👥 Athlete Directory"),
+                  React.createElement('div', { className: "overflow-x-auto" },
+                    React.createElement('table', { className: "w-full border-collapse bg-white rounded-lg overflow-hidden shadow-sm" },
+                      React.createElement('thead', { className: "bg-gray-100" },
+                        React.createElement('tr', null,
+                          React.createElement('th', { className: "border border-gray-300 px-4 py-3 text-left font-semibold" }, "Athlete"),
+                          React.createElement('th', { className: "border border-gray-300 px-4 py-3 text-left font-semibold" }, "Contact"),
+                          React.createElement('th', { className: "border border-gray-300 px-4 py-3 text-left font-semibold" }, "Status"),
+                          React.createElement('th', { className: "border border-gray-300 px-4 py-3 text-left font-semibold" }, "Profile"),
+                          React.createElement('th', { className: "border border-gray-300 px-4 py-3 text-left font-semibold" }, "Activity")
+                        )
+                      ),
+                      React.createElement('tbody', null,
+                        athletes.map(athlete => {
+                          const missing = ['firstName', 'lastName', 'email', 'dateOfBirth'].filter(field => 
+                            !athlete[field] || String(athlete[field]).trim() === ''
+                          );
+                          const isCheckedInToday = checkedInToday.some(record => record.athleteId === athlete.id);
+                          const age = athlete.dateOfBirth ? calculateAge(athlete.dateOfBirth) : null;
+                          
+                          return React.createElement('tr', { key: athlete.id, className: "hover:bg-gray-50 transition-colors" },
+                            React.createElement('td', { className: "border border-gray-300 px-4 py-3" },
+                              React.createElement('div', null,
+                                React.createElement('div', { className: "font-medium" }, `${athlete.firstName} ${athlete.lastName}`),
+                                age !== null && React.createElement('div', { className: "text-sm text-gray-600" }, 
+                                  `Age: ${age}`,
+                                  age < 18 && React.createElement('span', { className: "ml-2 text-xs bg-yellow-200 px-1 rounded" }, "Minor")
+                                )
+                              )
+                            ),
+                            React.createElement('td', { className: "border border-gray-300 px-4 py-3" },
+                              React.createElement('div', null,
+                                React.createElement('div', { className: "text-sm" }, athlete.email),
+                                athlete.phone && React.createElement('div', { className: "text-sm text-gray-600" }, athlete.phone)
+                              )
+                            ),
+                            React.createElement('td', { className: "border border-gray-300 px-4 py-3" },
+                              React.createElement('div', { className: "space-y-1" },
+                                React.createElement('div', null,
+                                  athlete.waiverSigned ? (
+                                    React.createElement('span', { className: "text-green-600 text-sm font-medium" }, "✓ Waiver Signed")
+                                  ) : (
+                                    React.createElement('span', { className: "text-red-600 text-sm font-medium" }, "✗ Waiver Missing")
+                                  )
+                                ),
+                                isCheckedInToday && React.createElement('span', { className: "text-blue-600 text-xs bg-blue-100 px-2 py-1 rounded" }, "Checked in today")
+                              )
+                            ),
+                            React.createElement('td', { className: "border border-gray-300 px-4 py-3" },
+                              missing.length > 0 ? (
+                                React.createElement('span', { className: "text-yellow-600 text-sm" }, `⚠️ ${missing.length} field(s) missing`)
+                              ) : (
+                                React.createElement('span', { className: "text-green-600 text-sm" }, "✓ Complete")
+                              )
+                            ),
+                            React.createElement('td', { className: "border border-gray-300 px-4 py-3" },
+                              React.createElement('div', { className: "text-sm text-gray-600" },
+                                athlete.lastVisit ? 
+                                  `Last: ${new Date(athlete.lastVisit).toLocaleDateString()}` : 
+                                  'Never visited'
+                              )
+                            )
+                          );
+                        })
+                      )
+                    )
+                  )
                 )
               )
-            )
-          );
+            );
+          };
 
           return (
             React.createElement('div', { className: "min-h-screen bg-gray-100 py-8" },
-              React.createElement('nav', { className: "max-w-4xl mx-auto mb-8" },
-                React.createElement('div', { className: "bg-white rounded-lg shadow-lg p-4" },
-                  React.createElement('div', { className: "flex justify-center gap-4" },
-                    React.createElement('button', {
-                      onClick: () => setCurrentView('checkin'),
-                      className: `px-6 py-2 rounded font-semibold ${
-                        currentView === 'checkin' 
-                          ? 'bg-blue-600 text-white' 
-                          : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
-                      }`
-                    }, "Check-In"),
-                    React.createElement('button', {
-                      onClick: () => setCurrentView('waiver'),
-                      className: `px-6 py-2 rounded font-semibold ${
-                        currentView === 'waiver' 
-                          ? 'bg-blue-600 text-white' 
-                          : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
-                      }`
-                    }, "Sign Waiver"),
-                    React.createElement('button', {
-                      onClick: () => setCurrentView('admin'),
-                      className: `px-6 py-2 rounded font-semibold ${
-                        currentView === 'admin' 
-                          ? 'bg-blue-600 text-white' 
-                          : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
-                      }`
-                    }, "Admin Panel")
+              // Header with title
+              React.createElement('div', { className: "max-w-6xl mx-auto mb-8" },
+                React.createElement('div', { className: "bg-white rounded-lg shadow-lg p-6" },
+                  React.createElement('div', { className: "text-center" },
+                    React.createElement('h1', { className: "text-4xl font-bold text-gray-800" }, "Open Gym Check-In")
                   )
                 )
               ),
 
+              currentView === 'welcome' && React.createElement(WelcomeScreen),
               currentView === 'checkin' && React.createElement(CheckInSystem),
-              currentView === 'waiver' && React.createElement(WaiverForm),
-              currentView === 'admin' && React.createElement(AdminPanel)
+              currentView === 'admin' && React.createElement(AdminPanel),
+              
+              // Floating Admin Button (always visible except on admin page)
+              currentView !== 'admin' && React.createElement('button', {
+                onClick: () => setCurrentView('admin'),
+                className: "fixed bottom-6 right-6 bg-blue-600 hover:bg-blue-700 text-white p-4 rounded-full shadow-lg hover:shadow-xl transition-all duration-300 transform hover:scale-110 z-50",
+                title: "Admin Dashboard & Reports"
+              },
+                React.createElement('div', { className: "flex items-center justify-center" },
+                  React.createElement('span', { className: "text-2xl" }, "📊")
+                )
+              )
             )
           );
         };
