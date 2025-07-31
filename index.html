@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gym Check-In System</title>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body>
+    <div id="root"></div>
+    <script type="text/babel">
+        const { useState, useEffect, useCallback, useRef } = React;
+
+        const GymCheckInSystem = () => {
+          const [currentView, setCurrentView] = useState('checkin');
+          const [athletes, setAthletes] = useState([]);
+          const [checkedInToday, setCheckedInToday] = useState([]);
+          const [searchQuery, setSearchQuery] = useState('');
+          const searchInputRef = useRef(null);
+          const [waiverForm, setWaiverForm] = useState({
+            firstName: '',
+            lastName: '',
+            email: '',
+            phone: '',
+            dateOfBirth: '',
+            emergencyContact: '',
+            emergencyPhone: '',
+            medicalConditions: '',
+            signature: '',
+            parentSignature: '',
+            parentName: ''
+          });
+
+          const SHEETS_URL = 'https://script.google.com/a/macros/aznova.org/s/AKfycbwGysrOxULjnQEXOsVxsPcIwbasX4D-l9quwYM65VNI3g7MFK_ZsiSascOwQpXOX48/exec';
+
+          useEffect(() => {
+            loadAthletes();
+          }, []);
+
+          const loadAthletes = async () => {
+            try {
+              console.log('=== LOADING ATHLETES DEBUG ===');
+              console.log('Fetching from URL:', SHEETS_URL);
+              
+              const response = await fetch(SHEETS_URL);
+              console.log('Response status:', response.status);
+              
+              const data = await response.json();
+              console.log('Full JSON response:', JSON.stringify(data, null, 2));
+              
+              if (data.success && data.athletes) {
+                console.log('Athletes array length:', data.athletes.length);
+                console.log('Header row:', data.athletes[0]);
+                if (data.athletes.length > 1) {
+                  console.log('Data row:', data.athletes[1]);
+                }
+                
+                if (data.athletes.length > 1) {
+                  const rawAthletes = data.athletes.slice(1);
+                  console.log('Raw athletes to process:', rawAthletes);
+                  
+                  const athletes = rawAthletes.map((row, index) => {
+                    console.log(`Processing row ${index}:`, row);
+                    
+                    const athlete = {
+                      id: row[0] || (Date.now() + index),
+                      firstName: String(row[1] || '').trim(),
+                      lastName: String(row[2] || '').trim(), 
+                      email: String(row[3] || '').trim(),
+                      phone: String(row[4] || '').trim(),
+                      waiverSigned: Boolean(row[5]),
+                      waiverDate: row[6] ? String(row[6]).split('T')[0] : null,
+                      dateOfBirth: row[7] ? String(row[7]).split('T')[0] : '',
+                      emergencyContact: String(row[8] || '').trim(),
+                      emergencyPhone: String(row[9] || '').trim(),
+                      medicalConditions: String(row[10] || '').trim()
+                    };
+                    
+                    console.log(`Created athlete ${index}:`, athlete);
+                    return athlete;
+                  });
+                  
+                  const validAthletes = athletes.filter(athlete => 
+                    athlete.firstName.length > 0 && athlete.lastName.length > 0
+                  );
+                  
+                  console.log('Final valid athletes:', validAthletes);
+                  setAthletes(validAthletes);
+                  
+                  if (validAthletes.length === 0) {
+                    console.error('No athletes passed validation!');
+                  }
+                } else {
+                  console.log('Only header row found, no data');
+                  setAthletes([]);
+                }
+              } else {
+                console.error('Invalid response format:', data);
+                setAthletes([]);
+              }
+            } catch (error) {
+              console.error('Error loading athletes:', error);
+              setAthletes([]);
+            }
+          };
+
+          const saveAthlete = async (athlete) => {
+            try {
+              await fetch(SHEETS_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ 
+                  type: 'athlete',
+                  id: athlete.id,
+                  firstName: athlete.firstName,
+                  lastName: athlete.lastName,
+                  email: athlete.email,
+                  phone: athlete.phone,
+                  waiverSigned: athlete.waiverSigned,
+                  waiverDate: athlete.waiverDate,
+                  dateOfBirth: athlete.dateOfBirth
+                })
+              });
+            } catch (error) {
+              console.error('Error saving athlete:', error);
+            }
+          };
+
+          const saveCheckIn = async (checkIn) => {
+            try {
+              await fetch(SHEETS_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ 
+                  type: 'checkin',
+                  athleteId: checkIn.athleteId,
+                  name: checkIn.name,
+                  time: checkIn.time,
+                  date: checkIn.date
+                })
+              });
+            } catch (error) {
+              console.error('Error saving check-in:', error);
+            }
+          };
+
+          const handleWaiverSubmit = async () => {
+            if (!waiverForm.firstName || !waiverForm.lastName || !waiverForm.email || !waiverForm.signature) {
+              alert('Please fill in all required fields and provide your signature');
+              return;
+            }
+
+            const isMinor = calculateAge(waiverForm.dateOfBirth) < 18;
+            if (isMinor && (!waiverForm.parentSignature || !waiverForm.parentName)) {
+              alert('Parent/Guardian signature required for minors');
+              return;
+            }
+
+            const newAthlete = {
+              id: Date.now(),
+              firstName: waiverForm.firstName,
+              lastName: waiverForm.lastName,
+              email: waiverForm.email,
+              phone: waiverForm.phone,
+              dateOfBirth: waiverForm.dateOfBirth,
+              waiverSigned: true,
+              waiverDate: new Date().toISOString().split('T')[0],
+              emergencyContact: waiverForm.emergencyContact,
+              emergencyPhone: waiverForm.emergencyPhone,
+              medicalConditions: waiverForm.medicalConditions,
+              isMinor: isMinor,
+              parentName: isMinor ? waiverForm.parentName : null
+            };
+
+            setAthletes(prev => [...prev, newAthlete]);
+            await saveAthlete(newAthlete);
+            
+            setWaiverForm({
+              firstName: '',
+              lastName: '',
+              email: '',
+              phone: '',
+              dateOfBirth: '',
+              emergencyContact: '',
+              emergencyPhone: '',
+              medicalConditions: '',
+              signature: '',
+              parentSignature: '',
+              parentName: ''
+            });
+            
+            alert('Waiver signed successfully! You can now check in.');
+            setCurrentView('checkin');
+          };
+
+          const calculateAge = (dateOfBirth) => {
+            const today = new Date();
+            const birthDate = new Date(dateOfBirth);
+            let age = today.getFullYear() - birthDate.getFullYear();
+            const monthDiff = today.getMonth() - birthDate.getMonth();
+            if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birthDate.getDate())) {
+              age--;
+            }
+            return age;
+          };
+
+          const handleCheckIn = async (athlete) => {
+            const today = new Date().toDateString();
+            const checkInRecord = {
+              athleteId: athlete.id,
+              name: `${athlete.firstName} ${athlete.lastName}`,
+              time: new Date().toLocaleTimeString(),
+              date: today
+            };
+            
+            setCheckedInToday(prev => [...prev, checkInRecord]);
+            await saveCheckIn(checkInRecord);
+            alert(`${athlete.firstName} ${athlete.lastName} checked in successfully!`);
+          };
+
+          const searchAthletes = useCallback(() => {
+            if (!searchQuery.trim()) return [];
+            
+            return athletes.filter(athlete => 
+              `${athlete.firstName} ${athlete.lastName}`.toLowerCase().includes(searchQuery.toLowerCase()) ||
+              athlete.email.toLowerCase().includes(searchQuery.toLowerCase()) ||
+              athlete.phone.includes(searchQuery)
+            );
+          }, [searchQuery, athletes]);
+
+          const isCheckedInToday = (athleteId) => {
+            const today = new Date().toDateString();
+            return checkedInToday.some(record => 
+              record.athleteId === athleteId && record.date === today
+            );
+          };
+
+          const handleSearchChange = useCallback((e) => {
+            const cursorPosition = e.target.selectionStart;
+            setSearchQuery(e.target.value);
+            
+            setTimeout(() => {
+              if (searchInputRef.current) {
+                searchInputRef.current.focus();
+                searchInputRef.current.setSelectionRange(cursorPosition, cursorPosition);
+              }
+            }, 0);
+          }, []);
+
+          const WaiverForm = () => (
+            React.createElement('div', { className: "max-w-2xl mx-auto bg-white p-6 rounded-lg shadow-lg" },
+              React.createElement('h2', { className: "text-2xl font-bold mb-6 text-center" }, "Gym Liability Waiver"),
+              
+              React.createElement('div', { className: "space-y-4" },
+                React.createElement('div', { className: "grid grid-cols-2 gap-4" },
+                  React.createElement('input', {
+                    type: "text",
+                    placeholder: "First Name *",
+                    value: waiverForm.firstName,
+                    onChange: (e) => setWaiverForm(prev => ({...prev, firstName: e.target.value})),
+                    className: "border rounded px-3 py-2"
+                  }),
+                  React.createElement('input', {
+                    type: "text",
+                    placeholder: "Last Name *",
+                    value: waiverForm.lastName,
+                    onChange: (e) => setWaiverForm(prev => ({...prev, lastName: e.target.value})),
+                    className: "border rounded px-3 py-2"
+                  })
+                ),
+
+                React.createElement('input', {
+                  type: "email",
+                  placeholder: "Email Address *",
+                  value: waiverForm.email,
+                  onChange: (e) => setWaiverForm(prev => ({...prev, email: e.target.value})),
+                  className: "w-full border rounded px-3 py-2"
+                }),
+
+                React.createElement('div', { className: "grid grid-cols-2 gap-4" },
+                  React.createElement('input', {
+                    type: "tel",
+                    placeholder: "Phone Number",
+                    value: waiverForm.phone,
+                    onChange: (e) => setWaiverForm(prev => ({...prev, phone: e.target.value})),
+                    className: "border rounded px-3 py-2"
+                  }),
+                  React.createElement('input', {
+                    type: "date",
+                    placeholder: "Date of Birth *",
+                    value: waiverForm.dateOfBirth,
+                    onChange: (e) => setWaiverForm(prev => ({...prev, dateOfBirth: e.target.value})),
+                    className: "border rounded px-3 py-2"
+                  })
+                ),
+
+                React.createElement('div', { className: "grid grid-cols-2 gap-4" },
+                  React.createElement('input', {
+                    type: "text",
+                    placeholder: "Emergency Contact Name",
+                    value: waiverForm.emergencyContact,
+                    onChange: (e) => setWaiverForm(prev => ({...prev, emergencyContact: e.target.value})),
+                    className: "border rounded px-3 py-2"
+                  }),
+                  React.createElement('input', {
+                    type: "tel",
+                    placeholder: "Emergency Contact Phone",
+                    value: waiverForm.emergencyPhone,
+                    onChange: (e) => setWaiverForm(prev => ({...prev, emergencyPhone: e.target.value})),
+                    className: "border rounded px-3 py-2"
+                  })
+                ),
+
+                React.createElement('textarea', {
+                  placeholder: "Medical Conditions or Allergies",
+                  value: waiverForm.medicalConditions,
+                  onChange: (e) => setWaiverForm(prev => ({...prev, medicalConditions: e.target.value})),
+                  className: "w-full border rounded px-3 py-2 h-20"
+                }),
+
+                React.createElement('div', { className: "bg-gray-50 p-4 rounded" },
+                  React.createElement('h3', { className: "font-semibold mb-2" }, "Liability Waiver Agreement"),
+                  React.createElement('p', { className: "text-sm text-gray-700 mb-4" },
+                    "I acknowledge that participation in gym activities involves inherent risks. I voluntarily assume all risks and waive any claims against the gym, its owners, employees, and agents. I am physically fit to participate and will follow all safety guidelines."
+                  ),
+                  
+                  React.createElement('input', {
+                    type: "text",
+                    placeholder: "Type your full name as electronic signature *",
+                    value: waiverForm.signature,
+                    onChange: (e) => setWaiverForm(prev => ({...prev, signature: e.target.value})),
+                    className: "w-full border rounded px-3 py-2 mb-2"
+                  }),
+                  
+                  waiverForm.dateOfBirth && calculateAge(waiverForm.dateOfBirth) < 18 && (
+                    React.createElement('div', { className: "mt-4 p-3 bg-yellow-50 border border-yellow-200 rounded" },
+                      React.createElement('h4', { className: "font-semibold text-yellow-800" }, "Parent/Guardian Consent Required"),
+                      React.createElement('input', {
+                        type: "text",
+                        placeholder: "Parent/Guardian Name *",
+                        value: waiverForm.parentName,
+                        onChange: (e) => setWaiverForm(prev => ({...prev, parentName: e.target.value})),
+                        className: "w-full border rounded px-3 py-2 mt-2 mb-2"
+                      }),
+                      React.createElement('input', {
+                        type: "text",
+                        placeholder: "Parent/Guardian Electronic Signature *",
+                        value: waiverForm.parentSignature,
+                        onChange: (e) => setWaiverForm(prev => ({...prev, parentSignature: e.target.value})),
+                        className: "w-full border rounded px-3 py-2"
+                      })
+                    )
+                  )
+                ),
+
+                React.createElement('button', {
+                  onClick: handleWaiverSubmit,
+                  className: "w-full bg-blue-600 text-white py-3 rounded font-semibold hover:bg-blue-700"
+                }, "Sign Waiver & Complete Registration")
+              )
+            )
+          );
+
+          const CheckInSystem = () => (
+            React.createElement('div', { className: "max-w-4xl mx-auto" },
+              React.createElement('div', { className: "bg-white rounded-lg shadow-lg p-6 mb-6" },
+                React.createElement('h2', { className: "text-2xl font-bold mb-4 text-center" }, "Gym Check-In System"),
+                
+                React.createElement('div', { className: "flex gap-4 mb-6" },
+                  React.createElement('input', {
+                    ref: searchInputRef,
+                    type: "text",
+                    placeholder: "Search by name, email, or phone...",
+                    value: searchQuery,
+                    onChange: handleSearchChange,
+                    className: "flex-1 border rounded px-4 py-2",
+                    autoComplete: "off",
+                    spellCheck: "false",
+                    autoFocus: false
+                  }),
+                  React.createElement('button', {
+                    onClick: loadAthletes,
+                    className: "bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700",
+                    title: "Refresh athlete list from Google Sheets"
+                  }, "Refresh"),
+                  React.createElement('button', {
+                    onClick: () => setCurrentView('waiver'),
+                    className: "bg-green-600 text-white px-6 py-2 rounded hover:bg-green-700"
+                  }, "Sign Waiver")
+                ),
+
+                React.createElement('div', { className: "mb-4 text-sm text-gray-600" },
+                  `Athletes loaded: ${athletes.length} | ${athletes.filter(a => a.waiverSigned).length} with signed waivers`
+                ),
+
+                searchQuery && (
+                  React.createElement('div', { className: "space-y-3" },
+                    searchAthletes().length === 0 ? (
+                      React.createElement('div', { className: "text-center py-8" },
+                        React.createElement('div', { className: "mx-auto h-12 w-12 text-gray-400 mb-4" }, "!"),
+                        React.createElement('p', { className: "text-gray-600 mb-4" }, "No athlete found with that information."),
+                        React.createElement('button', {
+                          onClick: () => setCurrentView('waiver'),
+                          className: "bg-blue-600 text-white px-6 py-2 rounded hover:bg-blue-700"
+                        }, "Sign Waiver to Register")
+                      )
+                    ) : (
+                      searchAthletes().map(athlete => (
+                        React.createElement('div', { key: athlete.id, className: "border rounded-lg p-4 flex items-center justify-between" },
+                          React.createElement('div', { className: "flex items-center gap-4" },
+                            React.createElement('div', { className: "h-10 w-10 text-gray-400" }, "👤"),
+                            React.createElement('div', null,
+                              React.createElement('h3', { className: "font-semibold" }, `${athlete.firstName} ${athlete.lastName}`),
+                              React.createElement('p', { className: "text-sm text-gray-600" }, athlete.email),
+                              React.createElement('p', { className: "text-xs text-gray-500" },
+                                `Waiver: ${athlete.waiverSigned ? `Signed ${athlete.waiverDate}` : 'Not signed'}`
+                              )
+                            )
+                          ),
+                          
+                          React.createElement('div', { className: "flex items-center gap-3" },
+                            athlete.waiverSigned ? 
+                              React.createElement('div', { className: "h-6 w-6 text-green-500" }, "✓") :
+                              React.createElement('div', { className: "h-6 w-6 text-red-500" }, "✗"),
+                            
+                            athlete.waiverSigned ? (
+                              isCheckedInToday(athlete.id) ? (
+                                React.createElement('div', { className: "bg-gray-100 text-gray-600 px-4 py-2 rounded" },
+                                  "Already Checked In"
+                                )
+                              ) : (
+                                React.createElement('button', {
+                                  onClick: () => handleCheckIn(athlete),
+                                  className: "bg-green-600 text-white px-6 py-2 rounded hover:bg-green-700"
+                                }, "Check In")
+                              )
+                            ) : (
+                              React.createElement('button', {
+                                onClick: () => setCurrentView('waiver'),
+                                className: "bg-red-600 text-white px-6 py-2 rounded hover:bg-red-700"
+                              }, "Sign Waiver First")
+                            )
+                          )
+                        )
+                      ))
+                    )
+                  )
+                )
+              ),
+
+              checkedInToday.length > 0 && (
+                React.createElement('div', { className: "bg-white rounded-lg shadow-lg p-6" },
+                  React.createElement('h3', { className: "text-lg font-semibold mb-4 flex items-center gap-2" },
+                    React.createElement('div', { className: "h-5 w-5" }, "🕐"),
+                    `Today's Check-ins (${checkedInToday.length})`
+                  ),
+                  React.createElement('div', { className: "space-y-2" },
+                    checkedInToday.map((record, index) => (
+                      React.createElement('div', { key: index, className: "flex justify-between items-center py-2 border-b" },
+                        React.createElement('span', { className: "font-medium" }, record.name),
+                        React.createElement('span', { className: "text-sm text-gray-600" }, record.time)
+                      )
+                    ))
+                  )
+                )
+              )
+            )
+          );
+
+          const AdminPanel = () => (
+            React.createElement('div', { className: "max-w-6xl mx-auto" },
+              React.createElement('div', { className: "bg-white rounded-lg shadow-lg p-6" },
+                React.createElement('h2', { className: "text-2xl font-bold mb-6" }, "Admin Panel"),
+                
+                React.createElement('div', { className: "grid grid-cols-1 md:grid-cols-3 gap-6 mb-8" },
+                  React.createElement('div', { className: "bg-blue-50 p-4 rounded-lg" },
+                    React.createElement('h3', { className: "font-semibold text-blue-800" }, "Total Athletes"),
+                    React.createElement('p', { className: "text-2xl font-bold text-blue-600" }, athletes.length)
+                  ),
+                  React.createElement('div', { className: "bg-green-50 p-4 rounded-lg" },
+                    React.createElement('h3', { className: "font-semibold text-green-800" }, "Waivers Signed"),
+                    React.createElement('p', { className: "text-2xl font-bold text-green-600" },
+                      athletes.filter(a => a.waiverSigned).length
+                    )
+                  ),
+                  React.createElement('div', { className: "bg-purple-50 p-4 rounded-lg" },
+                    React.createElement('h3', { className: "font-semibold text-purple-800" }, "Today's Check-ins"),
+                    React.createElement('p', { className: "text-2xl font-bold text-purple-600" }, checkedInToday.length)
+                  )
+                ),
+
+                React.createElement('div', { className: "overflow-x-auto" },
+                  React.createElement('table', { className: "w-full border-collapse border border-gray-300" },
+                    React.createElement('thead', { className: "bg-gray-50" },
+                      React.createElement('tr', null,
+                        React.createElement('th', { className: "border border-gray-300 px-4 py-2 text-left" }, "Name"),
+                        React.createElement('th', { className: "border border-gray-300 px-4 py-2 text-left" }, "Email"),
+                        React.createElement('th', { className: "border border-gray-300 px-4 py-2 text-left" }, "Phone"),
+                        React.createElement('th', { className: "border border-gray-300 px-4 py-2 text-left" }, "Waiver Status"),
+                        React.createElement('th', { className: "border border-gray-300 px-4 py-2 text-left" }, "Waiver Date")
+                      )
+                    ),
+                    React.createElement('tbody', null,
+                      athletes.map(athlete => (
+                        React.createElement('tr', { key: athlete.id, className: "hover:bg-gray-50" },
+                          React.createElement('td', { className: "border border-gray-300 px-4 py-2" },
+                            `${athlete.firstName} ${athlete.lastName}`,
+                            athlete.isMinor && React.createElement('span', { className: "text-xs bg-yellow-200 px-1 rounded ml-2" }, "Minor")
+                          ),
+                          React.createElement('td', { className: "border border-gray-300 px-4 py-2" }, athlete.email),
+                          React.createElement('td', { className: "border border-gray-300 px-4 py-2" }, athlete.phone),
+                          React.createElement('td', { className: "border border-gray-300 px-4 py-2" },
+                            athlete.waiverSigned ? (
+                              React.createElement('span', { className: "text-green-600 font-semibold" }, "✓ Signed")
+                            ) : (
+                              React.createElement('span', { className: "text-red-600 font-semibold" }, "✗ Not Signed")
+                            )
+                          ),
+                          React.createElement('td', { className: "border border-gray-300 px-4 py-2" }, athlete.waiverDate || 'N/A')
+                        )
+                      ))
+                    )
+                  )
+                )
+              )
+            )
+          );
+
+          return (
+            React.createElement('div', { className: "min-h-screen bg-gray-100 py-8" },
+              React.createElement('nav', { className: "max-w-4xl mx-auto mb-8" },
+                React.createElement('div', { className: "bg-white rounded-lg shadow-lg p-4" },
+                  React.createElement('div', { className: "flex justify-center gap-4" },
+                    React.createElement('button', {
+                      onClick: () => setCurrentView('checkin'),
+                      className: `px-6 py-2 rounded font-semibold ${
+                        currentView === 'checkin' 
+                          ? 'bg-blue-600 text-white' 
+                          : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                      }`
+                    }, "Check-In"),
+                    React.createElement('button', {
+                      onClick: () => setCurrentView('waiver'),
+                      className: `px-6 py-2 rounded font-semibold ${
+                        currentView === 'waiver' 
+                          ? 'bg-blue-600 text-white' 
+                          : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                      }`
+                    }, "Sign Waiver"),
+                    React.createElement('button', {
+                      onClick: () => setCurrentView('admin'),
+                      className: `px-6 py-2 rounded font-semibold ${
+                        currentView === 'admin' 
+                          ? 'bg-blue-600 text-white' 
+                          : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                      }`
+                    }, "Admin Panel")
+                  )
+                )
+              ),
+
+              currentView === 'checkin' && React.createElement(CheckInSystem),
+              currentView === 'waiver' && React.createElement(WaiverForm),
+              currentView === 'admin' && React.createElement(AdminPanel)
+            )
+          );
+        };
+
+        ReactDOM.render(React.createElement(GymCheckInSystem), document.getElementById('root'));
+    </script>
+</body>
+</html>
