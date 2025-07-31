@@ -130,21 +130,15 @@
           };
 
           const saveCheckIn = async (checkIn) => {
-            try {
-              await fetch(SHEETS_URL, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ 
-                  type: 'checkin',
-                  athleteId: checkIn.athleteId,
-                  name: checkIn.name,
-                  time: checkIn.time,
-                  date: checkIn.date
-                })
-              });
-            } catch (error) {
-              console.error('Error saving check-in:', error);
-            }
+              try {
+                const url = `${SHEETS_URL}?action=checkin&athleteId=${checkIn.athleteId}&name=${encodeURIComponent(checkIn.name)}&time=${encodeURIComponent(checkIn.time)}&date=${encodeURIComponent(checkIn.date)}`;
+                
+                const response = await fetch(url);
+                const data = await response.json();
+                console.log('Check-in response:', data);
+              } catch (error) {
+                console.error('Error saving check-in:', error);
+              }
           };
 
           const handleWaiverSubmit = async () => {
