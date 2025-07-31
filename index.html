@@ -13,6 +13,7 @@
     <div id="root"></div>
     <script type="text/babel">
         const { useState, useEffect, useCallback, useRef } = React;
+        console.warn = () => {}; // Suppress development warnings
 
         const GymCheckInSystem = () => {
           const [currentView, setCurrentView] = useState('checkin');
@@ -66,7 +67,7 @@
                     console.log(`Processing row ${index}:`, row);
                     
                     const athlete = {
-                      id: row[0] !== null && row[0] !== undefined && row[0] !== '' ? row[0] : (Date.now() + index),
+                      id: row[0] != null ? row[0] : (Date.now() + index),
                       firstName: String(row[1] || '').trim(),
                       lastName: String(row[2] || '').trim(), 
                       email: String(row[3] || '').trim(),
